@@ -241,7 +241,7 @@ async def execute_sell(
         side="SELL",
         price=price,
         size=round(shares, 2),
-        fee_rate_bps=0,  # Taker fee é implícita no matching
+        fee_rate_bps=MAKER_FEE_BPS,  # Polymarket exige fee_rate em todos os orders
     )
     return result
 
