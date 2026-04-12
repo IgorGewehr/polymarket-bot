@@ -98,12 +98,12 @@ def evaluate_early_exit(
     if price_drop >= STOP_LOSS_THRESHOLD_PCT:
         return ExitEvaluation(True, "stop_loss", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 4. TAKE PROFIT — ganho bom (ativa a partir de 200s restantes) ──
-    if time_remaining < 200 and gain_pct >= TAKE_PROFIT_MIN_GAIN_PCT and sell_pnl > hold_ev:
+    # ── 4. TAKE PROFIT — ganho bom (ativa SEMPRE, sem restrição de tempo) ──
+    if gain_pct >= TAKE_PROFIT_MIN_GAIN_PCT and sell_pnl > hold_ev:
         return ExitEvaluation(True, "take_profit", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
     # ── 5. EV PURO — vender é significativamente melhor ──
-    if time_remaining < 200 and sell_pnl > 0 and sell_pnl > hold_ev * 1.15:
+    if sell_pnl > 0 and sell_pnl > hold_ev * 1.15:
         return ExitEvaluation(True, "ev_optimal", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
     return no_exit
