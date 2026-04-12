@@ -9,6 +9,9 @@ data/trades.duckdb.wal
 data/cycle_data.xlsx
 data/bot.log
 
+# IDE
+.idea/
+
 # OS
 .DS_Store
 *.pyc
