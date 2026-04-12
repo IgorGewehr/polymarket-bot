@@ -489,8 +489,8 @@ class TradingEngine:
                  ret=f"{expected_return:.0%}",
                  remaining=f"{time_remaining:.0f}s")
 
-        # Sizing limitado a $2 max (entry tardio = menos edge)
-        bet_size = min(2, calculate_bet_size(
+        # Sizing $3 para ter 5+ shares (habilita early exit)
+        bet_size = calculate_bet_size(
             confidence=0.0,
             expected_return=expected_return,
             time_remaining=time_remaining,
@@ -499,7 +499,7 @@ class TradingEngine:
             is_drawdown=self.risk_manager.is_drawdown,
             entry_price=entry_price,
             trend_strength=2,
-        ))
+        )
 
         token_id = self._get_yes_token(market) if direction == "Up" \
             else self._get_no_token(market)
@@ -568,6 +568,20 @@ class TradingEngine:
                 time_remaining=time_remaining,
                 current_delta=current_delta,
             )
+
+            # Log avaliação a cada 30s para debug
+            if int(time_remaining) % 30 < 3:
+                our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
+                gain = (our_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0
+                drop = (pos.entry_price - our_price) / pos.entry_price if pos.entry_price > 0 else 0
+                log.info("exit_eval",
+                         our=f"${our_price:.2f}",
+                         gain=f"{gain:.0%}",
+                         shares=f"{pos.shares:.1f}",
+                         can_sell=pos.shares >= 5,
+                         should=exit_eval.should_exit,
+                         reason=exit_eval.reason or "none",
+                         remaining=f"{time_remaining:.0f}s")
 
             if exit_eval.should_exit:
                 order = await execute_sell(
