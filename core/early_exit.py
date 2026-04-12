@@ -93,21 +93,17 @@ def evaluate_early_exit(
             and sell_pnl > 0):
         return ExitEvaluation(True, "delta_guard", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # Não avaliar TP/SL muito cedo (deixar trade desenvolver)
-    if time_remaining > 200:
-        return no_exit
-
-    # ── 3. STOP LOSS — preço caiu demais ──
+    # ── 3. STOP LOSS — preço caiu demais (ativa SEMPRE, sem restrição de tempo) ──
     price_drop = (entry_price - bid_price) / entry_price if entry_price > 0 else 0
     if price_drop >= STOP_LOSS_THRESHOLD_PCT:
         return ExitEvaluation(True, "stop_loss", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 4. TAKE PROFIT — ganho bom E vender > segurar ──
-    if gain_pct >= TAKE_PROFIT_MIN_GAIN_PCT and sell_pnl > hold_ev:
+    # ── 4. TAKE PROFIT — ganho bom (ativa a partir de 200s restantes) ──
+    if time_remaining < 200 and gain_pct >= TAKE_PROFIT_MIN_GAIN_PCT and sell_pnl > hold_ev:
         return ExitEvaluation(True, "take_profit", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
     # ── 5. EV PURO — vender é significativamente melhor ──
-    if sell_pnl > 0 and sell_pnl > hold_ev * 1.15:
+    if time_remaining < 200 and sell_pnl > 0 and sell_pnl > hold_ev * 1.15:
         return ExitEvaluation(True, "ev_optimal", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
     return no_exit

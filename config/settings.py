@@ -109,7 +109,7 @@ LOCK_MIN_TIME_REMAINING = 30       # Não tentar lock com < 30s restantes
 # ── Early Exit (Take Profit / Stop Loss) ────────────────────────
 EARLY_EXIT_ENABLED = True
 TAKER_FEE_PCT = 0.0315             # Fee de taker para SELL orders
-TAKE_PROFIT_MIN_GAIN_PCT = 0.30    # Ganho mínimo de 30% para considerar TP
+TAKE_PROFIT_MIN_GAIN_PCT = 0.25    # Ganho mínimo de 25% para considerar TP
 STOP_LOSS_THRESHOLD_PCT = 0.35     # Vender se preço caiu 35%+ do entry
 EARLY_EXIT_MIN_TIME = 15           # Não vender nos últimos 15s
 EARLY_EXIT_MAX_TIME = 200          # Começar a avaliar exit mais cedo
