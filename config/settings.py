@@ -98,6 +98,24 @@ HEDGE_COOLDOWN_SECONDS = 900    # 15 min entre hedges
 HEDGE_COST_RATIO_LIMIT = 1.5   # Se custo > 1.5x savings, parar
 
 
+# ── Lock Profit (compra assimétrica YES+NO) ─────────────────────
+LOCK_PROFIT_ENABLED = True
+LOCK_MIN_PROFIT_PER_SHARE = 0.02   # Mínimo $0.02/share para executar
+LOCK_FEE_RATE = 0.10               # 10% maker fee
+LOCK_SPREAD_BUFFER = 0.02          # Buffer de spread quando usa preço derivado
+LOCK_MIN_TIME_REMAINING = 30       # Não tentar lock com < 30s restantes
+
+
+# ── Early Exit (Take Profit / Stop Loss) ────────────────────────
+EARLY_EXIT_ENABLED = True
+TAKER_FEE_PCT = 0.0315             # Fee de taker para SELL orders
+TAKE_PROFIT_MIN_GAIN_PCT = 0.40    # Ganho mínimo de 40% para considerar TP
+STOP_LOSS_THRESHOLD_PCT = 0.50     # Vender se preço caiu 50%+ do entry
+EARLY_EXIT_MIN_TIME = 30           # Não vender nos últimos 30s
+EARLY_EXIT_MAX_TIME = 240          # Não vender nos primeiros 60s de monitoramento
+REVERSAL_RISK_DIVISOR = 1200.0     # Para desconto de reversão
+
+
 # ── Risk Management ─────────────────────────────────────────────
 MAX_DAILY_LOSS = 15.0           # Stop loss diário
 MAX_TRADES_PER_DAY = 200

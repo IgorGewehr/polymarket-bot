@@ -223,3 +223,44 @@ async def execute_hedge(
 ) -> dict | None:
     """Executa um hedge (compra share do lado oposto)."""
     return await execute_trade(client, token_id, "hedge", amount, price)
+
+
+async def execute_sell(
+    client: OrderClient,
+    token_id: str,
+    shares: float,
+    price: float,
+) -> dict | None:
+    """Vende shares para sair da posição (take profit / stop loss)."""
+    if price <= 0 or price >= 1 or shares < 5.0:
+        log.warning("invalid_sell", price=price, shares=shares)
+        return None
+
+    result = await client.place_order(
+        token_id=token_id,
+        side="SELL",
+        price=price,
+        size=round(shares, 2),
+        fee_rate_bps=0,  # Taker fee é implícita no matching
+    )
+    return result
+
+
+async def execute_lock(
+    client: OrderClient,
+    token_id: str,
+    price: float,
+    shares: float,
+) -> dict | None:
+    """Compra lado oposto para lock profit garantido."""
+    if price <= 0 or price >= 1:
+        return None
+
+    result = await client.place_order(
+        token_id=token_id,
+        side="BUY",
+        price=round(price, 2),
+        size=max(round(shares, 2), 5.0),
+        fee_rate_bps=MAKER_FEE_BPS,
+    )
+    return result

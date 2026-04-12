@@ -247,6 +247,20 @@ class PolymarketREST:
             log.error("midpoint_error", error=str(e))
             return None
 
+    async def get_best_ask(self, token_id: str) -> float | None:
+        """Retorna o melhor ask (menor oferta de venda) para um token."""
+        book = await self.get_orderbook(token_id)
+        if not book:
+            return None
+        asks = book.get("asks", [])
+        if not asks:
+            return None
+        try:
+            best = min(float(a["price"]) for a in asks)
+            return best if 0 < best < 1 else None
+        except (ValueError, KeyError):
+            return None
+
     async def close(self):
         await self.gamma_client.aclose()
         await self.clob_client.aclose()

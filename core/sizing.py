@@ -1,10 +1,8 @@
 """
-Sistema de sizing dinâmico — $1 a $3.
-Calibrado nos dados de 57 trades manuais.
+Sistema de sizing — Kelly fracionário por convicção.
+Aposta $1 a $3 baseado no edge real (probabilidade vs preço da share).
 """
 from config.settings import (
-    SIZING_WEIGHT_CONFIDENCE, SIZING_WEIGHT_RETURN,
-    SIZING_WEIGHT_TIME, SIZING_WEIGHT_DIRECTION,
     SIZING_HIGH_THRESHOLD, SIZING_MID_THRESHOLD,
     TIME_BONUS, DIRECTION_BONUS,
     LOSS_PENALTY_RATE, LOSS_PENALTY_FLOOR,
@@ -26,6 +24,84 @@ def get_time_slot(time_remaining: float) -> str:
         return "1:30"
 
 
+def estimate_win_probability(
+    trend_strength: int,
+    entry_price: float,
+    direction: str,
+) -> float:
+    """
+    Estima probabilidade de ganhar baseado na força da trend.
+
+    Args:
+        trend_strength: Quantos timeframes concordam (0-3)
+        entry_price: Preço da share ($0.50-$0.75)
+        direction: "Up" ou "Down"
+
+    Returns:
+        Probabilidade estimada (0.0-1.0)
+    """
+    # Base: preço da share É a probabilidade do mercado
+    market_prob = entry_price
+
+    # Ajuste por trend strength
+    # 3/3 TF concordam → mercado provavelmente está certo, +5%
+    # 2/3 TF concordam → sinal moderado, +2%
+    # 1/3 ou 0/3 → contra a trend, -5% (não deveria acontecer com nossos filtros)
+    if trend_strength >= 3:
+        adjustment = 0.05
+    elif trend_strength >= 2:
+        adjustment = 0.02
+    else:
+        adjustment = -0.05
+
+    # Up historicamente ganha mais (89%) que Down (62%)
+    if direction == "Down":
+        adjustment -= 0.03
+
+    return min(0.85, max(0.40, market_prob + adjustment))
+
+
+def calculate_kelly_size(
+    entry_price: float,
+    estimated_prob: float,
+    bankroll: float = 10.0,
+    kelly_fraction: float = 0.25,
+) -> float:
+    """
+    Calcula bet size via Kelly fracionário.
+
+    Kelly: f* = (p*b - q) / b
+    onde p = prob de ganhar, q = 1-p, b = odds (retorno por $1 apostado)
+
+    Args:
+        entry_price: Preço da share
+        estimated_prob: Probabilidade estimada de ganhar
+        bankroll: Capital disponível
+        kelly_fraction: Fração de Kelly (0.25 = quarter Kelly)
+
+    Returns:
+        Bet size em dólares
+    """
+    if entry_price <= 0 or entry_price >= 1:
+        return 1.0
+
+    # Odds: quanto ganha por $1 apostado (ex: share @ $0.55 → odds = 0.45/0.55 = 0.818)
+    b = (1.0 - entry_price) / entry_price
+    p = estimated_prob
+    q = 1.0 - p
+
+    # Kelly: f* = (p*b - q) / b
+    kelly = (p * b - q) / b if b > 0 else 0
+
+    if kelly <= 0:
+        return 1.0  # Edge negativo → bet mínimo
+
+    # Quarter Kelly × bankroll
+    raw_size = kelly * kelly_fraction * bankroll
+
+    return raw_size
+
+
 def calculate_bet_size(
     confidence: float,
     expected_return: float,
@@ -33,19 +109,13 @@ def calculate_bet_size(
     direction: str,
     consecutive_losses: int,
     is_drawdown: bool = False,
-    is_squeeze_breakout: bool = False
+    is_squeeze_breakout: bool = False,
+    entry_price: float = 0.50,
+    trend_strength: int = 2,
 ) -> int:
     """
     Calcula o tamanho da aposta ($1, $2, ou $3).
-
-    Args:
-        confidence: Score de confiança (-6 a +6)
-        expected_return: Retorno esperado (0.0 a 1.0+)
-        time_remaining: Segundos restantes no ciclo
-        direction: "Up" ou "Down"
-        consecutive_losses: Número de losses consecutivos
-        is_drawdown: True se em drawdown do dia
-        is_squeeze_breakout: True se é breakout após squeeze
+    Usa Kelly fracionário como base, ajustado por penalidades.
 
     Returns:
         Valor da aposta: 1, 2, ou 3
@@ -54,78 +124,57 @@ def calculate_bet_size(
     if is_drawdown:
         return FORCED_SIZING_ON_DRAWDOWN
 
-    time_slot = get_time_slot(time_remaining)
+    # Estimar probabilidade de ganhar
+    prob = estimate_win_probability(trend_strength, entry_price, direction)
 
-    # ── Fator 1: Confiança (40%) ──
-    conf_normalized = min(abs(confidence) / 6.0, 1.0)
+    # Kelly sizing
+    kelly_size = calculate_kelly_size(entry_price, prob)
 
-    # ── Fator 2: Retorno esperado (25%) ──
-    if expected_return >= 0.30:
-        ret_score = 1.0
-    elif expected_return >= 0.15:
-        ret_score = 0.6
-    else:
-        ret_score = 0.3
-
-    # ── Fator 3: Bonus de tempo (20%) ──
-    t_bonus = TIME_BONUS.get(time_slot, 0.3)
-
-    # ── Fator 4: Bonus de direção (15%) ──
-    d_bonus = DIRECTION_BONUS.get(direction, 0.65)
-
-    # ── Penalty por losses consecutivos ──
+    # Penalty por losses consecutivos
     loss_penalty = max(
         LOSS_PENALTY_FLOOR,
         1.0 - (consecutive_losses * LOSS_PENALTY_RATE)
     )
 
-    # Score composto
-    raw_score = (
-        conf_normalized * SIZING_WEIGHT_CONFIDENCE +
-        ret_score * SIZING_WEIGHT_RETURN +
-        t_bonus * SIZING_WEIGHT_TIME +
-        d_bonus * SIZING_WEIGHT_DIRECTION
-    ) * loss_penalty
+    # Time bonus (entrada cedo = mais edge)
+    time_slot = get_time_slot(time_remaining)
+    t_bonus = TIME_BONUS.get(time_slot, 0.3)
 
-    # Bonus por squeeze breakout (sinal raro mas forte)
+    # Score final
+    adjusted = kelly_size * loss_penalty * t_bonus
+
+    # Bonus por squeeze breakout
     if is_squeeze_breakout:
-        raw_score *= 1.2
+        adjusted *= 1.2
 
-    # Mapeamento para valor
-    if raw_score >= SIZING_HIGH_THRESHOLD:
+    # Mapeamento para $1-$3
+    if adjusted >= 2.5:
         return 3
-    elif raw_score >= SIZING_MID_THRESHOLD:
+    elif adjusted >= 1.5:
         return 2
     else:
         return 1
 
 
 def sizing_breakdown(
-    confidence: float,
-    expected_return: float,
-    time_remaining: float,
+    entry_price: float,
     direction: str,
+    trend_strength: int,
+    time_remaining: float,
     consecutive_losses: int
 ) -> dict:
     """Retorna breakdown detalhado do cálculo para logging."""
+    prob = estimate_win_probability(trend_strength, entry_price, direction)
+    kelly_size = calculate_kelly_size(entry_price, prob)
     time_slot = get_time_slot(time_remaining)
-    conf_normalized = min(abs(confidence) / 6.0, 1.0)
-    ret_score = 1.0 if expected_return >= 0.30 else (0.6 if expected_return >= 0.15 else 0.3)
-    t_bonus = TIME_BONUS.get(time_slot, 0.3)
-    d_bonus = DIRECTION_BONUS.get(direction, 0.65)
     loss_penalty = max(LOSS_PENALTY_FLOOR, 1.0 - (consecutive_losses * LOSS_PENALTY_RATE))
+    t_bonus = TIME_BONUS.get(time_slot, 0.3)
 
     return {
-        "confidence_factor": round(conf_normalized * SIZING_WEIGHT_CONFIDENCE, 3),
-        "return_factor": round(ret_score * SIZING_WEIGHT_RETURN, 3),
-        "time_factor": round(t_bonus * SIZING_WEIGHT_TIME, 3),
-        "direction_factor": round(d_bonus * SIZING_WEIGHT_DIRECTION, 3),
+        "estimated_prob": round(prob, 3),
+        "kelly_raw": round(kelly_size, 3),
         "loss_penalty": round(loss_penalty, 2),
-        "raw_score": round(
-            (conf_normalized * SIZING_WEIGHT_CONFIDENCE +
-             ret_score * SIZING_WEIGHT_RETURN +
-             t_bonus * SIZING_WEIGHT_TIME +
-             d_bonus * SIZING_WEIGHT_DIRECTION) * loss_penalty, 3
-        ),
+        "time_bonus": round(t_bonus, 2),
         "time_slot": time_slot,
+        "final_score": round(kelly_size * loss_penalty * t_bonus, 3),
     }

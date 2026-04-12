@@ -26,12 +26,25 @@ class Position:
     token_id: str
     entry_confidence: float = 0.0
     entry_alignment: int = 0
+    shares: float = 0.0
     # Hedge tracking
     hedge_cost: float = 0.0
     hedge_price: float = 0.0
     hedge_direction: str = ""
     hedge_potential_return: float = 0.0
     has_hedge: bool = False
+    # Lock profit tracking
+    has_lock: bool = False
+    lock_price_b: float = 0.0
+    lock_shares: float = 0.0
+    lock_guaranteed_profit: float = 0.0
+    lock_side_b_direction: str = ""
+    lock_side_b_token_id: str = ""
+    # Early exit tracking
+    exited_early: bool = False
+    exit_price: float = 0.0
+    exit_proceeds: float = 0.0
+    exit_reason: str = ""
 
 
 @dataclass
