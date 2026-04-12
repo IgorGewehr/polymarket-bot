@@ -138,11 +138,8 @@ def calculate_bet_size(
     if loss_penalty < 0.6:
         return 1  # Após 2+ losses, sizing mínimo
 
-    if trend_strength >= 2 and entry_price <= 0.65:
-        return 3  # Trend 2/3+ e preço bom = $3 (habilita lock/exit com 5+ shares)
-
     if trend_strength >= 2:
-        return 2  # Trend 2/3+ mas preço alto
+        return 3  # Trend 2/3+ = $3 (5+ shares em preços <= $0.60)
 
     return 1  # Trend fraca
 
