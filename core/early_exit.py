@@ -16,9 +16,9 @@ from config.settings import (
 
 log = structlog.get_logger()
 
-# Safety sell: share alta perto do fim → vender
-SAFETY_SELL_PRICE = 0.80       # Share >= $0.80
-SAFETY_SELL_TIME = 120         # Com < 2min restantes
+# Safety sell: share muito alta → vender (lucro grande, pouco upside restante)
+SAFETY_SELL_PRICE = 0.85       # Share >= $0.85 → max $0.15 upside vs risco de reversão
+SAFETY_SELL_TIME = 200         # Ativar depois dos primeiros 100s de monitoramento
 
 # Delta guard: mercado indeciso perto do fim → vender se tem lucro
 DELTA_GUARD_THRESHOLD = 10     # Delta < 10 = indeciso
@@ -81,8 +81,8 @@ def evaluate_early_exit(
     if time_remaining < 10:
         return no_exit
 
-    # ── 1. SAFETY SELL — share alta perto do fim ──
-    # Share >= $0.80 com < 2min → lucro quase certo, vender para garantir
+    # ── 1. SAFETY SELL — share muito alta → vender ──
+    # Share >= $0.85 → max upside é $0.15/share, não vale o risco de reversão
     if bid_price >= SAFETY_SELL_PRICE and time_remaining < SAFETY_SELL_TIME:
         return ExitEvaluation(True, "safety_sell", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
