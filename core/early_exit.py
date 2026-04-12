@@ -93,7 +93,11 @@ def evaluate_early_exit(
             and sell_pnl > 0):
         return ExitEvaluation(True, "delta_guard", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 3. STOP LOSS — preço caiu demais (ativa SEMPRE, sem restrição de tempo) ──
+    # ── 3. EMERGENCY SELL — share abaixo de $0.20 → vender IMEDIATAMENTE ──
+    if bid_price < 0.20:
+        return ExitEvaluation(True, "emergency", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
+    # ── 4. STOP LOSS — preço caiu demais (ativa SEMPRE, sem restrição de tempo) ──
     price_drop = (entry_price - bid_price) / entry_price if entry_price > 0 else 0
     if price_drop >= STOP_LOSS_THRESHOLD_PCT:
         return ExitEvaluation(True, "stop_loss", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
