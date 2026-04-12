@@ -1,0 +1,27 @@
+# Core
+asyncio-mqtt==0.16.2
+httpx[http2]==0.27.0
+websockets==12.0
+uvloop==0.19.0
+
+# Data & Analysis
+numpy==1.26.4
+polars==0.20.31
+
+# Storage
+duckdb==0.10.3
+redis==5.0.4
+
+# Polymarket
+py-clob-client==0.17.2
+python-dotenv==1.0.1
+
+# Monitoring
+python-telegram-bot==21.3
+
+# Excel export
+openpyxl==3.1.5
+
+# Utilities
+orjson==3.10.3
+structlog==24.2.0

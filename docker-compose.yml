@@ -1,0 +1,27 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - bot-data:/app/data
+    depends_on:
+      - redis
+    networks:
+      - botnet
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - botnet
+
+volumes:
+  bot-data:
+  redis-data:
+
+networks:
+  botnet:
