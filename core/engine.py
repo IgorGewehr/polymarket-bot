@@ -232,7 +232,7 @@ class TradingEngine:
         Estratégia:
         1. Determinar trend REAL do BTC via Binance (slope dos últimos minutos)
         2. Ver o que o mercado Polymarket acha (YES price)
-        3. Se mercado CONCORDA com a trend e share está 0.50-0.75 → ENTRAR
+        3. Se mercado CONCORDA com a trend e share está 0.50-0.62 → ENTRAR
         4. Se mercado DISCORDA da trend → ESPERAR até 3:30 para ver se reverte
         5. Se não reverteu até ~3:30 → apostar no lado do mercado (>0.50)
         """
@@ -305,7 +305,7 @@ class TradingEngine:
                 return
             else:
                 # Deadline: seguir o mercado
-                if 0.50 <= market_price <= 0.75:
+                if 0.50 <= market_price <= 0.62:
                     direction = market_trend
                     entry_price = market_price
                     log.info("entry_deadline_neutral",
@@ -316,7 +316,7 @@ class TradingEngine:
                     return
 
         # BTC trend e mercado CONCORDAM + preço na faixa → ENTRAR
-        elif btc_trend == market_trend and 0.50 <= market_price <= 0.75:
+        elif btc_trend == market_trend and 0.50 <= market_price <= 0.62:
             direction = market_trend
             entry_price = market_price
             log.info("entry_aligned",
@@ -337,7 +337,7 @@ class TradingEngine:
                 return
             else:
                 # Deadline: seguir mercado
-                if 0.50 <= market_price <= 0.75:
+                if 0.50 <= market_price <= 0.62:
                     direction = market_trend
                     entry_price = market_price
                     log.info("entry_deadline",
@@ -349,7 +349,7 @@ class TradingEngine:
                     return
 
         # Preço fora da faixa
-        elif not (0.50 <= market_price <= 0.75):
+        elif not (0.50 <= market_price <= 0.62):
             log.info("skip_price_range",
                      price=f"${market_price:.2f}")
             return
@@ -473,10 +473,10 @@ class TradingEngine:
 
         # Só entrar se a share SAIU do range indeciso
         # Se ainda está $0.45-$0.55, continuar esperando
-        if 0.55 < yes_price <= 0.75:
+        if 0.55 < yes_price <= 0.62:
             direction = "Up"
             entry_price = yes_price
-        elif 0.55 < no_price <= 0.75:
+        elif 0.55 < no_price <= 0.62:
             direction = "Down"
             entry_price = no_price
         else:
@@ -845,16 +845,16 @@ class TradingEngine:
     ) -> float | None:
         """
         Encontra o preço de entrada.
-        Range: $0.50 a $0.75 (retorno de 33% a 100%).
+        Range: $0.50 a $0.62 (retorno de 33% a 100%).
         """
         if direction == "Up":
             price = current_price
-            if price < 0.50 or price > 0.75:
+            if price < 0.50 or price > 0.62:
                 return None
             return price
         else:
             price = 1 - current_price  # Preço da NO share
-            if price < 0.50 or price > 0.75:
+            if price < 0.50 or price > 0.62:
                 return None
             return price
 
