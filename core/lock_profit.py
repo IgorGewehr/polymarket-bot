@@ -50,12 +50,17 @@ def evaluate_lock(
     shares_a: float,
 ) -> LockOpportunity | None:
     """Avalia se vale executar lock profit."""
+    # Precisa de pelo menos 5 shares no lado A para fazer lock
+    if shares_a < 5.0:
+        return None
+
     is_profitable, profit_per_share = calculate_lock_profit(price_a, price_b)
 
     if not is_profitable or profit_per_share < LOCK_MIN_PROFIT_PER_SHARE:
         return None
 
-    shares = max(shares_a, 5.0)
+    # Comprar MESMA quantidade de shares que temos no lado A
+    shares = round(shares_a, 2)
     cost_b = price_b * shares
 
     return LockOpportunity(
