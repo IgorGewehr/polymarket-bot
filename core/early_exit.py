@@ -73,8 +73,8 @@ def evaluate_early_exit(
 
     no_exit = ExitEvaluation(False, "", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # Mínimo 5 shares para vender
-    if shares < 5.0:
+    # Mínimo ~4.5 shares para vender (fills parciais podem dar menos que 5)
+    if shares < 4.5:
         return no_exit
 
     # Não vender nos últimos 10s (muito perto da resolução, spread pode ser ruim)

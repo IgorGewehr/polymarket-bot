@@ -587,10 +587,20 @@ class TradingEngine:
                          remaining=f"{time_remaining:.0f}s")
 
             if exit_eval.should_exit:
-                order = await execute_sell(
-                    self.order_client, pos.token_id,
-                    pos.shares, exit_eval.sell_price,
-                )
+                # Vender todas as shares — retry com quantidade menor se falhar
+                order = None
+                for pct in [1.0, 0.95, 0.90, 0.85]:
+                    sell_qty = round(pos.shares * pct, 2)
+                    order = await execute_sell(
+                        self.order_client, pos.token_id,
+                        sell_qty, exit_eval.sell_price,
+                    )
+                    if order:
+                        log.info("sell_executed",
+                                 qty=sell_qty,
+                                 price=f"${exit_eval.sell_price:.2f}",
+                                 pct=f"{pct:.0%}")
+                        break
                 if order:
                     pnl = exit_eval.sell_pnl
                     pos.exited_early = True

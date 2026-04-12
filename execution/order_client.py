@@ -75,8 +75,9 @@ class OrderClient:
         Returns:
             Resposta da API ou simulação em dry run
         """
-        # Garantir mínimo de 5 shares (Polymarket minimum_order_size)
-        size = max(size, 5.0)
+        # Garantir mínimo de 5 shares para BUY (Polymarket minimum_order_size)
+        if side.upper() == "BUY":
+            size = max(size, 5.0)
 
         if self.dry_run:
             order = {
@@ -232,7 +233,7 @@ async def execute_sell(
     price: float,
 ) -> dict | None:
     """Vende shares para sair da posição (take profit / stop loss)."""
-    if price <= 0 or price >= 1 or shares < 5.0:
+    if price <= 0 or price >= 1 or shares < 1.0:
         log.warning("invalid_sell", price=price, shares=shares)
         return None
 
@@ -241,7 +242,7 @@ async def execute_sell(
         side="SELL",
         price=price,
         size=round(shares, 2),
-        fee_rate_bps=MAKER_FEE_BPS,  # Polymarket exige fee_rate em todos os orders
+        fee_rate_bps=MAKER_FEE_BPS,
     )
     return result
 
