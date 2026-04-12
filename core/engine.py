@@ -617,8 +617,13 @@ class TradingEngine:
                     self.share_buffer.clear()
                     return
 
-        # ── 2. LOCK PROFIT (compra assimétrica YES+NO) ──
-        if not pos.has_lock and not pos.has_hedge and time_remaining > 30:
+        # ── 2. LOCK PROFIT — SÓ quando estamos PERDENDO ──
+        # Se share está acima do entry (ganhando) → não fazer lock, deixar take profit/safety sell agir
+        # Se share caiu abaixo do entry (perdendo) → lock para garantir que não perde tudo
+        our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
+        is_losing = our_price < pos.entry_price * 0.90  # Share caiu 10%+ do entry
+
+        if not pos.has_lock and not pos.has_hedge and time_remaining > 30 and is_losing:
             opp_dir = "Down" if pos.direction == "Up" else "Up"
             opp_token = self._get_no_token(market) if pos.direction == "Up" \
                 else self._get_yes_token(market)
