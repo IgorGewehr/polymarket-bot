@@ -555,8 +555,9 @@ class TradingEngine:
         if not pos or pos.exited_early:
             return
 
-        # ── 1. EARLY EXIT (take profit / stop loss) ──
-        if not pos.has_lock and not pos.has_hedge and yes_price > 0:
+        # ── 1. EARLY EXIT (safety sell / delta guard / TP / SL) ──
+        current_delta = abs(self._calculate_delta(yes_price)) if yes_price > 0 else 0
+        if not pos.has_lock and yes_price > 0:
             exit_eval = evaluate_early_exit(
                 direction=pos.direction,
                 entry_price=pos.entry_price,
@@ -564,6 +565,7 @@ class TradingEngine:
                 cost_basis=pos.bet_size,
                 current_yes_price=yes_price,
                 time_remaining=time_remaining,
+                current_delta=current_delta,
             )
 
             if exit_eval.should_exit:

@@ -1,18 +1,28 @@
 """
-Early Exit — Take Profit e Stop Loss vendendo shares antes da resolução.
+Early Exit — Safety Sell, Delta Guard, Take Profit e Stop Loss.
 
-Compara PnL de vender agora vs EV de segurar até o fim,
-com desconto de risco de reversão de último segundo.
+Prioridade:
+1. Safety Sell: share >= $0.80 com < 2min → vender (lucro quase certo)
+2. Delta Guard: delta < 10 nos últimos 60s com lucro → vender (50/50 não vale o risco)
+3. Take Profit: ganho >= 30% E vender > hold_ev → vender
+4. Stop Loss: preço caiu 35%+ do entry → vender para limitar loss
 """
 import structlog
 from dataclasses import dataclass
 from config.settings import (
     TAKER_FEE_PCT, TAKE_PROFIT_MIN_GAIN_PCT,
-    STOP_LOSS_THRESHOLD_PCT, EARLY_EXIT_MIN_TIME,
-    EARLY_EXIT_MAX_TIME, REVERSAL_RISK_DIVISOR,
+    STOP_LOSS_THRESHOLD_PCT, REVERSAL_RISK_DIVISOR,
 )
 
 log = structlog.get_logger()
+
+# Safety sell: share alta perto do fim → vender
+SAFETY_SELL_PRICE = 0.80       # Share >= $0.80
+SAFETY_SELL_TIME = 120         # Com < 2min restantes
+
+# Delta guard: mercado indeciso perto do fim → vender se tem lucro
+DELTA_GUARD_THRESHOLD = 10     # Delta < 10 = indeciso
+DELTA_GUARD_TIME = 60          # Nos últimos 60s
 
 
 @dataclass
@@ -33,11 +43,13 @@ def evaluate_early_exit(
     cost_basis: float,
     current_yes_price: float,
     time_remaining: float,
+    current_delta: float = 0.0,
 ) -> ExitEvaluation:
     """
     Avalia se vale vender shares agora.
 
-    Returns ExitEvaluation com should_exit e reason.
+    Args:
+        current_delta: delta absoluto atual do ciclo (para delta guard)
     """
     # Preço bid das NOSSAS shares
     if direction == "Up":
@@ -52,34 +64,49 @@ def evaluate_early_exit(
     sell_pnl = sell_proceeds - cost_basis
     gain_pct = (bid_price - entry_price) / entry_price if entry_price > 0 else 0
 
-    # EV de segurar até resolução (com desconto de reversão)
+    # EV de segurar (com desconto de reversão)
     win_pnl = shares * 1.0 - cost_basis
     loss_pnl = -cost_basis
-
     reversal_discount = max(0.05, min(0.20, time_remaining / REVERSAL_RISK_DIVISOR))
     adjusted_p = p_win * (1 - reversal_discount)
     hold_ev = adjusted_p * win_pnl + (1 - adjusted_p) * loss_pnl
 
     no_exit = ExitEvaluation(False, "", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # Guards de tempo
-    if time_remaining < EARLY_EXIT_MIN_TIME or time_remaining > EARLY_EXIT_MAX_TIME:
-        return no_exit
-
     # Mínimo 5 shares para vender
     if shares < 5.0:
         return no_exit
 
-    # Stop loss: preço caiu 50%+ do entry
+    # Não vender nos últimos 10s (muito perto da resolução, spread pode ser ruim)
+    if time_remaining < 10:
+        return no_exit
+
+    # ── 1. SAFETY SELL — share alta perto do fim ──
+    # Share >= $0.80 com < 2min → lucro quase certo, vender para garantir
+    if bid_price >= SAFETY_SELL_PRICE and time_remaining < SAFETY_SELL_TIME:
+        return ExitEvaluation(True, "safety_sell", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
+    # ── 2. DELTA GUARD — mercado indeciso nos últimos 60s ──
+    # Delta < 10 = 50/50, se temos lucro → vender
+    if (time_remaining < DELTA_GUARD_TIME
+            and abs(current_delta) < DELTA_GUARD_THRESHOLD
+            and sell_pnl > 0):
+        return ExitEvaluation(True, "delta_guard", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
+    # Não avaliar TP/SL muito cedo (deixar trade desenvolver)
+    if time_remaining > 200:
+        return no_exit
+
+    # ── 3. STOP LOSS — preço caiu demais ──
     price_drop = (entry_price - bid_price) / entry_price if entry_price > 0 else 0
     if price_drop >= STOP_LOSS_THRESHOLD_PCT:
         return ExitEvaluation(True, "stop_loss", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # Take profit: ganho >= 40% E vender é melhor que segurar
+    # ── 4. TAKE PROFIT — ganho bom E vender > segurar ──
     if gain_pct >= TAKE_PROFIT_MIN_GAIN_PCT and sell_pnl > hold_ev:
         return ExitEvaluation(True, "take_profit", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # EV puro: vender é significativamente melhor que segurar
+    # ── 5. EV PURO — vender é significativamente melhor ──
     if sell_pnl > 0 and sell_pnl > hold_ev * 1.15:
         return ExitEvaluation(True, "ev_optimal", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
