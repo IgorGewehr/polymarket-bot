@@ -124,36 +124,27 @@ def calculate_bet_size(
     if is_drawdown:
         return FORCED_SIZING_ON_DRAWDOWN
 
-    # Estimar probabilidade de ganhar
-    prob = estimate_win_probability(trend_strength, entry_price, direction)
-
-    # Kelly sizing
-    kelly_size = calculate_kelly_size(entry_price, prob)
-
     # Penalty por losses consecutivos
     loss_penalty = max(
         LOSS_PENALTY_FLOOR,
         1.0 - (consecutive_losses * LOSS_PENALTY_RATE)
     )
 
-    # Time bonus (entrada cedo = mais edge)
-    time_slot = get_time_slot(time_remaining)
-    t_bonus = TIME_BONUS.get(time_slot, 0.3)
+    # Sizing baseado na força da trend + preço da share
+    # $3 = trend forte + preço bom (habilita lock e early exit com 5+ shares)
+    # $2 = trend moderada ou preço alto
+    # $1 = após 2+ losses seguidos
 
-    # Score final
-    adjusted = kelly_size * loss_penalty * t_bonus
+    if loss_penalty < 0.6:
+        return 1  # Após 2+ losses, sizing mínimo
 
-    # Bonus por squeeze breakout
-    if is_squeeze_breakout:
-        adjusted *= 1.2
+    if trend_strength >= 2 and entry_price <= 0.65:
+        return 3  # Trend forte + preço bom = 5+ shares
 
-    # Mapeamento para $1-$3
-    if adjusted >= 2.5:
-        return 3
-    elif adjusted >= 1.5:
-        return 2
-    else:
-        return 1
+    if trend_strength >= 2:
+        return 2  # Trend forte mas preço alto
+
+    return 1  # Trend fraca
 
 
 def sizing_breakdown(

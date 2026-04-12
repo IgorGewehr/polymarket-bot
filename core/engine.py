@@ -647,11 +647,16 @@ class TradingEngine:
         if pos.has_lock:
             return
 
-        # ── 3. HEDGE (lógica original) ──
+        # ── 3. HEDGE ──
+        # Avaliar hedge se: momentum inverteu OU nossa share caiu muito
         share_prices = self.share_buffer.get_prices()
         btc_prices = self.btc_buffer.get_prices()
         if len(share_prices) < 5:
             return
+
+        # Check direto: nossa share caiu abaixo de $0.40?
+        our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
+        price_dropped = our_price < 0.40
 
         current_momentum = calc_momentum(share_prices)
         from core.analyzer import analyze_layer2_multiTF
@@ -659,7 +664,8 @@ class TradingEngine:
             btc_prices, pos.direction
         )
 
-        if should_evaluate_hedge(pos, current_momentum, current_alignment):
+        should_eval = should_evaluate_hedge(pos, current_momentum, current_alignment) or price_dropped
+        if should_eval:
             loss_prob = estimate_loss_probability(
                 pos, current_momentum,
                 current_alignment, pos.entry_alignment
