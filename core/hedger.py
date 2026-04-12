@@ -26,6 +26,12 @@ class Position:
     token_id: str
     entry_confidence: float = 0.0
     entry_alignment: int = 0
+    # Hedge tracking
+    hedge_cost: float = 0.0
+    hedge_price: float = 0.0
+    hedge_direction: str = ""
+    hedge_potential_return: float = 0.0
+    has_hedge: bool = False
 
 
 @dataclass

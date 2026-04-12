@@ -512,6 +512,13 @@ class TradingEngine:
                         hedge_cost, hedge_price
                     )
                     if order:
+                        # Registrar hedge na posição para PnL correto
+                        pos.has_hedge = True
+                        pos.hedge_cost = hedge_cost
+                        pos.hedge_price = hedge_price
+                        pos.hedge_direction = opposite_direction
+                        pos.hedge_potential_return = hedge_return
+
                         self.hedge_tracker.record_hedge(hedge_cost, savings)
                         log.info("hedge_executed",
                                  cost=f"${hedge_cost:.2f}",
@@ -530,22 +537,31 @@ class TradingEngine:
             return
 
         # Determinar resultado
-        # Em produção, verificar via API se o mercado resolveu YES ou NO
         final_price = self.poly_feed.yes_price
-        won = False
+        up_won = final_price > 0.5
 
-        if pos.direction == "Up" and final_price > 0.5:
-            won = True
-        elif pos.direction == "Down" and final_price <= 0.5:
-            won = True
+        # PnL da posição principal
+        main_won = (pos.direction == "Up" and up_won) or \
+                   (pos.direction == "Down" and not up_won)
 
-        if won:
-            pnl = pos.potential_return - pos.bet_size
+        if main_won:
+            main_pnl = pos.potential_return - pos.bet_size
         else:
-            pnl = -pos.bet_size
+            main_pnl = -pos.bet_size
 
-        # Subtrair custo de hedge se houve
-        # (simplificado — em produção, rastrear hedge separadamente)
+        # PnL do hedge (se existir)
+        hedge_pnl = 0.0
+        if pos.has_hedge:
+            hedge_won = (pos.hedge_direction == "Up" and up_won) or \
+                        (pos.hedge_direction == "Down" and not up_won)
+            if hedge_won:
+                hedge_pnl = pos.hedge_potential_return - pos.hedge_cost
+            else:
+                hedge_pnl = -pos.hedge_cost
+
+        # PnL total = principal + hedge
+        pnl = main_pnl + hedge_pnl
+        won = pnl > 0
 
         self.risk_manager.update(pnl)
 
@@ -553,6 +569,8 @@ class TradingEngine:
         log.info("trade_resolved",
                  result=result,
                  pnl=f"${pnl:+.2f}",
+                 main=f"${main_pnl:+.2f}",
+                 hedge=f"${hedge_pnl:+.2f}" if pos.has_hedge else "none",
                  pnl_today=f"${self.risk_manager.state.pnl_today:+.2f}",
                  direction=pos.direction)
 
