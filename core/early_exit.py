@@ -103,7 +103,8 @@ def evaluate_early_exit(
         return ExitEvaluation(True, "take_profit", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
     # ── 5. EV PURO — vender é significativamente melhor ──
-    if sell_pnl > 0 and sell_pnl > hold_ev * 1.15:
+    # Só ativar com gain mínimo de 15% (evitar vender muito cedo)
+    if gain_pct >= 0.15 and sell_pnl > 0 and sell_pnl > hold_ev * 1.30:
         return ExitEvaluation(True, "ev_optimal", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
     return no_exit

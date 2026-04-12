@@ -401,10 +401,11 @@ class TradingEngine:
         )
 
         if order:
-            shares = bet_size / entry_price
+            shares = max(bet_size / entry_price, 5.0)  # Mínimo 5 (Polymarket enforces)
+            actual_cost = shares * entry_price
             self.current_position = Position(
                 direction=direction,
-                bet_size=bet_size,
+                bet_size=actual_cost,
                 entry_price=entry_price,
                 potential_return=shares,
                 shares=shares,
@@ -512,17 +513,19 @@ class TradingEngine:
         )
 
         if order:
+            shares = max(bet_size / entry_price, 5.0)
+            actual_cost = shares * entry_price
             self.current_position = Position(
                 direction=direction,
-                bet_size=bet_size,
+                bet_size=actual_cost,
                 entry_price=entry_price,
-                potential_return=bet_size / entry_price,
-                shares=bet_size / entry_price,
+                potential_return=shares,
+                shares=shares,
                 entry_time=time.time(),
                 market_id=market.get("conditionId", market.get("condition_id", "")),
                 token_id=token_id,
             )
-            self.cycle_collector.record_trade(direction, bet_size, entry_price)
+            self.cycle_collector.record_trade(direction, actual_cost, entry_price)
             log.info("late_trade_executed",
                      direction=direction,
                      size=f"${bet_size}",
