@@ -448,31 +448,49 @@ class TradingEngine:
                 entry_alignment=int(analysis.layer2_alignment)
             )
 
-            # ── LIMIT SELL IMEDIATO a entry + $0.13 ──
-            # Captura oscilação natural. 63% dos trades preenchem antes da resolução.
-            target_price = round(entry_price + 0.13, 2)
-            target_price = min(target_price, 0.99)
+            # ── 2 LIMIT SELLS NO BOOK: profit + stop loss ──
             sell_qty = round(shares * 0.95, 2)
-            limit_order = await self.order_client.place_order(
+
+            # 1. PROFIT SELL a entry + $0.20
+            target_price = round(entry_price + 0.20, 2)
+            target_price = min(target_price, 0.99)
+            profit_order = await self.order_client.place_order(
                 token_id=token_id,
                 side="SELL",
                 price=target_price,
                 size=sell_qty,
                 fee_rate_bps=1000,
             )
-            if limit_order:
+            if profit_order:
                 oid = None
-                if isinstance(limit_order, dict):
-                    oid = limit_order.get("orderID") or limit_order.get("id")
+                if isinstance(profit_order, dict):
+                    oid = profit_order.get("orderID") or profit_order.get("id")
                 self.current_position._limit_sell_id = oid
                 self.current_position._limit_sell_price = target_price
                 self.current_position._limit_sell_qty = sell_qty
                 self.current_position._limit_sell_active = True
-                log.info("limit_sell_posted",
+                log.info("profit_sell_posted",
                          target=f"${target_price:.2f}",
                          entry=f"${entry_price:.2f}",
-                         profit=f"${0.13 * shares:.2f}",
-                         shares=f"{sell_qty:.1f}")
+                         profit_per_share=f"$0.20")
+
+            # 2. STOP LOSS SELL a $0.40 (caps loss a ~$1.73)
+            sl_order = await self.order_client.place_order(
+                token_id=token_id,
+                side="SELL",
+                price=0.40,
+                size=sell_qty,
+                fee_rate_bps=1000,
+            )
+            if sl_order:
+                oid = None
+                if isinstance(sl_order, dict):
+                    oid = sl_order.get("orderID") or sl_order.get("id")
+                self.current_position._sl_sell_id = oid
+                self.current_position._sl_sell_active = True
+                log.info("stop_loss_sell_posted",
+                         price="$0.40",
+                         max_loss=f"${6.00 - sell_qty * 0.40 * 0.97:.2f}")
 
             self.cycle_collector.record_trade(
                 direction=direction,
@@ -589,28 +607,38 @@ class TradingEngine:
                 token_id=token_id,
             )
 
-            # ── LIMIT SELL IMEDIATO (mesmo no late entry) ──
-            target_price = round(entry_price + 0.13, 2)
-            target_price = min(target_price, 0.99)
+            # ── 2 LIMIT SELLS NO BOOK (late entry) ──
             sell_qty = round(shares * 0.95, 2)
-            limit_order = await self.order_client.place_order(
-                token_id=token_id,
-                side="SELL",
-                price=target_price,
-                size=sell_qty,
-                fee_rate_bps=1000,
+
+            target_price = round(entry_price + 0.20, 2)
+            target_price = min(target_price, 0.99)
+            profit_order = await self.order_client.place_order(
+                token_id=token_id, side="SELL", price=target_price,
+                size=sell_qty, fee_rate_bps=1000,
             )
-            if limit_order:
+            if profit_order:
                 oid = None
-                if isinstance(limit_order, dict):
-                    oid = limit_order.get("orderID") or limit_order.get("id")
+                if isinstance(profit_order, dict):
+                    oid = profit_order.get("orderID") or profit_order.get("id")
                 self.current_position._limit_sell_id = oid
                 self.current_position._limit_sell_price = target_price
                 self.current_position._limit_sell_qty = sell_qty
                 self.current_position._limit_sell_active = True
-                log.info("limit_sell_posted",
+                log.info("profit_sell_posted",
                          target=f"${target_price:.2f}",
                          entry=f"${entry_price:.2f}")
+
+            sl_order = await self.order_client.place_order(
+                token_id=token_id, side="SELL", price=0.40,
+                size=sell_qty, fee_rate_bps=1000,
+            )
+            if sl_order:
+                oid = None
+                if isinstance(sl_order, dict):
+                    oid = sl_order.get("orderID") or sl_order.get("id")
+                self.current_position._sl_sell_id = oid
+                self.current_position._sl_sell_active = True
+                log.info("stop_loss_sell_posted", price="$0.40")
 
             self.cycle_collector.record_trade(direction, actual_cost, entry_price)
             log.info("late_trade_executed",
@@ -645,7 +673,7 @@ class TradingEngine:
         if not pos or pos.exited_early:
             return
 
-        # ── 0. CHECK LIMIT SELL FILL (entry + $0.13) ──
+        # ── 0. CHECK PROFIT SELL FILL (entry + $0.20) ──
         if getattr(pos, '_limit_sell_active', False) and getattr(pos, '_limit_sell_id', None):
             filled = await self.order_client._wait_for_fill(pos._limit_sell_id, timeout=0.5)
             if filled:
@@ -654,32 +682,47 @@ class TradingEngine:
                 pnl = sell_qty * sell_price * (1 - 0.0315) - pos.bet_size
                 pos.exited_early = True
                 pos.exit_price = sell_price
-                pos.exit_reason = "limit_sell_filled"
+                pos.exit_reason = "profit_sell_filled"
                 pos._limit_sell_active = False
                 self.risk_manager.update(pnl)
-                log.info("limit_sell_filled",
+                # Cancelar stop loss sell
+                if getattr(pos, '_sl_sell_active', False) and getattr(pos, '_sl_sell_id', None):
+                    await self.order_client.cancel_order(pos._sl_sell_id)
+                    pos._sl_sell_active = False
+                log.info("profit_sell_filled",
                          pnl=f"${pnl:+.2f}",
                          price=f"${sell_price:.2f}",
-                         entry=f"${pos.entry_price:.2f}",
-                         msg="Limit sell preencheu!")
+                         entry=f"${pos.entry_price:.2f}")
                 self._cycle_exited = pos.market_id
                 self.cycle_collector.end_cycle(yes_price, pnl)
                 self.current_position = None
                 self.share_buffer.clear()
                 return
 
-        # ── 0b. HÍBRIDO: se share > $0.75, cancelar limit sell → TP captura big win ──
-        if getattr(pos, '_limit_sell_active', False) and yes_price > 0:
-            our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
-            if our_price >= 0.75:
-                if getattr(pos, '_limit_sell_id', None):
+        # ── 0b. CHECK STOP LOSS SELL FILL ($0.40) ──
+        if getattr(pos, '_sl_sell_active', False) and getattr(pos, '_sl_sell_id', None):
+            filled = await self.order_client._wait_for_fill(pos._sl_sell_id, timeout=0.5)
+            if filled:
+                sell_qty = pos._limit_sell_qty
+                pnl = sell_qty * 0.40 * (1 - 0.0315) - pos.bet_size
+                pos.exited_early = True
+                pos.exit_price = 0.40
+                pos.exit_reason = "stop_loss_filled"
+                pos._sl_sell_active = False
+                self.risk_manager.update(pnl)
+                # Cancelar profit sell
+                if getattr(pos, '_limit_sell_active', False) and getattr(pos, '_limit_sell_id', None):
                     await self.order_client.cancel_order(pos._limit_sell_id)
-                pos._limit_sell_active = False
-                log.info("limit_sell_cancelled_for_tp",
-                         our_price=f"${our_price:.2f}",
-                         msg="Share > $0.75, cancelando limit pra capturar big win")
-
-        # (recovery sell antigo removido — substituído por trailing stop)
+                    pos._limit_sell_active = False
+                log.info("stop_loss_filled",
+                         pnl=f"${pnl:+.2f}",
+                         entry=f"${pos.entry_price:.2f}",
+                         msg="Stop loss a $0.40 preencheu no book!")
+                self._cycle_exited = pos.market_id
+                self.cycle_collector.end_cycle(yes_price, pnl)
+                self.current_position = None
+                self.share_buffer.clear()
+                return
 
         # ── 1. EXITS DE LUCRO APENAS — perdendo = hold to resolution ──
         current_delta = abs(self._calculate_delta(yes_price)) if yes_price > 0 else 0
@@ -709,83 +752,13 @@ class TradingEngine:
                          remaining=f"{time_remaining:.0f}s")
 
             if exit_eval.should_exit:
-
-                # ── RECOVERY ZONE: trailing stop com floor $0.48 ──
-                if exit_eval.reason == "recovery_zone":
-                    our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
-
-                    # Inicializar trailing se ainda não existe
-                    if not hasattr(pos, '_recovery_trailing_active'):
-                        pos._recovery_trailing_active = False
-                        pos._recovery_high = 0.0
-
-                    if our_price >= 0.48:
-                        # Preço voltou a $0.48+ → ativar trailing stop
-                        if not pos._recovery_trailing_active:
-                            pos._recovery_trailing_active = True
-                            pos._recovery_high = our_price
-                            log.info("trailing_stop_activated",
-                                     price=f"${our_price:.2f}",
-                                     msg="Preço recuperou a $0.48+, trailing ativo!")
-
-                        # Atualizar high
-                        pos._recovery_high = max(pos._recovery_high, our_price)
-
-                        # Vender se caiu 8% do pico da recovery (floor $0.48)
-                        # Dados: trailing 8% captura 62/81 losing trades, avg -$1.21
-                        trail_trigger = pos._recovery_high * 0.92
-                        trail_trigger = max(trail_trigger, 0.48)  # floor
-
-                        if our_price <= trail_trigger and pos._recovery_high > 0.50:
-                            log.info("trailing_stop_triggered",
-                                     price=f"${our_price:.2f}",
-                                     high=f"${pos._recovery_high:.2f}",
-                                     trigger=f"${trail_trigger:.2f}",
-                                     msg="Trailing stop! Vendendo no bounce")
-                            # Não retornar — deixar cair pro SELL normal abaixo
-                            exit_eval = ExitEvaluation(
-                                True, "trailing_recovery",
-                                our_price,
-                                pos.shares * our_price * (1 - 0.0315),
-                                pos.shares * our_price * (1 - 0.0315) - pos.bet_size,
-                                0, (our_price - pos.entry_price) / pos.entry_price
-                            )
-                        else:
-                            # Trailing ativo mas preço ainda subindo — segurar
-                            return
-                    else:
-                        # Preço ainda abaixo de $0.48
-                        # Dados de 81 trades: forced exit a 3:00 → avg loss -$1.13 (vs -$2.52 na resolução)
-                        # Quanto mais cedo corta, menos perde
-                        if time_remaining < 180:
-                            log.info("forced_exit_no_recovery",
-                                     price=f"${our_price:.2f}",
-                                     remaining=f"{time_remaining:.0f}s",
-                                     msg="Sem recovery, cortando loss antes da resolução")
-                            exit_eval = ExitEvaluation(
-                                True, "forced_exit",
-                                our_price,
-                                pos.shares * our_price * (1 - 0.0315),
-                                pos.shares * our_price * (1 - 0.0315) - pos.bet_size,
-                                0, (our_price - pos.entry_price) / pos.entry_price
-                            )
-                            # Cair pro SELL normal abaixo
-                        else:
-                            # Ainda tem tempo — esperar recovery
-                            if int(time_remaining) % 30 < 3:
-                                log.info("waiting_recovery",
-                                         price=f"${our_price:.2f}",
-                                         remaining=f"{time_remaining:.0f}s")
-                            return
-
-                # ── SELL normal (TP, EV optimal, safety sell, delta guard) ──
-                # Cancelar limit sells pendentes antes de vender no market
+                # Cancelar AMBOS limit sells antes de vender no market
                 if getattr(pos, '_limit_sell_active', False) and getattr(pos, '_limit_sell_id', None):
                     await self.order_client.cancel_order(pos._limit_sell_id)
                     pos._limit_sell_active = False
-                if getattr(pos, '_recovery_sell_pending', False) and getattr(pos, '_recovery_sell_order_id', None):
-                    await self.order_client.cancel_order(pos._recovery_sell_order_id)
-                    pos._recovery_sell_pending = False
+                if getattr(pos, '_sl_sell_active', False) and getattr(pos, '_sl_sell_id', None):
+                    await self.order_client.cancel_order(pos._sl_sell_id)
+                    pos._sl_sell_active = False
 
                 order = None
                 for pct in [1.0, 0.95, 0.90, 0.85]:

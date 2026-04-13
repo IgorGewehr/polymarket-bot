@@ -1,18 +1,16 @@
 """
-Early Exit — SÓ exits de LUCRO. Sem stop loss. Sem panic sell.
+Early Exit — Profit exits apenas. Stop loss é via limit order no book.
 
-Dados de 284 ciclos + 43 trades live mostram:
-- Hold to resolution = +$47.34 vs exits = -$5.06
-- 67% accuracy direcional do bot = edge enorme na resolução
-- Stop loss DESTRÓI valor: -$17.84 vs -$2.55 sem SL
-- Hedges custaram -$15 num dia (eliminados)
+Sistema de 2 limit sells no book desde a compra:
+1. PROFIT SELL a entry + $0.20 → captura wins (~$2.00 avg)
+2. STOP LOSS SELL a $0.40 → caps loss a ~$1.73
 
-Prioridade:
-1. Safety Sell: share >= $0.85 → vender (lucro garantido)
-2. Delta Guard: delta < 10 nos últimos 60s com lucro → vender
-3. Take Profit: ganho >= 40% → vender
-4. EV Optimal: ganho >= 25% e matematicamente melhor → vender
-5. Perdendo? → NÃO FAZER NADA. Hold to resolution.
+Quando um preenche, cancela o outro. Zero lag, zero slippage.
+
+Exits adicionais via monitor:
+- Safety Sell: share >= $0.85 → vender
+- Take Profit: ganho >= 35% → vender
+- EV Optimal: ganho >= 30% e matematicamente melhor → vender
 """
 import structlog
 from dataclasses import dataclass
@@ -50,7 +48,7 @@ def evaluate_early_exit(
     current_delta: float = 0.0,
     lowest_price_seen: float = 0.0,
 ) -> ExitEvaluation:
-    """Avalia se vale vender. SÓ vende com lucro. Nunca com loss."""
+    """Avalia exits de LUCRO. Stop loss é via limit order no book."""
     if direction == "Up":
         bid_price = current_yes_price
         p_win = current_yes_price
@@ -72,7 +70,6 @@ def evaluate_early_exit(
 
     if shares < 4.5:
         return no_exit
-
     if time_remaining < 10:
         return no_exit
 
@@ -80,20 +77,19 @@ def evaluate_early_exit(
     if bid_price >= SAFETY_SELL_PRICE and time_remaining < SAFETY_SELL_TIME:
         return ExitEvaluation(True, "safety_sell", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 2. DELTA GUARD — mercado indeciso com lucro ──
+    # ── 2. TAKE PROFIT — ganho >= 35% (subiu de 40%, dados mostram que era alto demais) ──
+    if gain_pct >= 0.35 and sell_pnl > hold_ev:
+        return ExitEvaluation(True, "take_profit", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
+    # ── 3. EV OPTIMAL — ganho >= 30% e vender > hold × 1.30 ──
+    if gain_pct >= 0.30 and sell_pnl > 0 and sell_pnl > hold_ev * 1.30:
+        return ExitEvaluation(True, "ev_optimal", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
+    # ── 4. DELTA GUARD — mercado indeciso com lucro ──
     if (time_remaining < DELTA_GUARD_TIME
             and abs(current_delta) < DELTA_GUARD_THRESHOLD
             and sell_pnl > 0):
         return ExitEvaluation(True, "delta_guard", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 3. TAKE PROFIT ──
-    if gain_pct >= TAKE_PROFIT_MIN_GAIN_PCT and sell_pnl > hold_ev:
-        return ExitEvaluation(True, "take_profit", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
-
-    # ── 4. EV OPTIMAL ──
-    if gain_pct >= 0.25 and sell_pnl > 0 and sell_pnl > hold_ev * 1.30:
-        return ExitEvaluation(True, "ev_optimal", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
-
-    # ── PERDENDO? NÃO VENDER. Hold to resolution. ──
-    # Dados: 67% accuracy, hold = +$47/dia vs exits = -$5/dia
+    # Stop loss é via limit order no book — não precisa de lógica aqui
     return no_exit
