@@ -63,17 +63,10 @@ class OrderClient:
         fee_rate_bps: int = 0,
     ) -> dict | None:
         """
-        Coloca uma limit order GTC no CLOB.
+        Coloca uma limit order GTC no CLOB e verifica fill.
 
-        Args:
-            token_id: ID do token (Up ou Down)
-            side: "BUY" para comprar shares
-            price: Preço por share (0.01 a 0.99)
-            size: Quantidade de shares
-            fee_rate_bps: Taxa de maker em basis points (ex: 1000 = 10%)
-
-        Returns:
-            Resposta da API ou simulação em dry run
+        Após postar, poll get_order por até 5s para confirmar MATCHED.
+        Se não fill, cancela a ordem e retorna None.
         """
         # Garantir mínimo de 5 shares para BUY (Polymarket minimum_order_size)
         if side.upper() == "BUY":
@@ -120,11 +113,65 @@ class OrderClient:
                      side=side,
                      price=price,
                      size=size)
+
+            # ── Verificar fill (poll por até 5s) ──
+            order_id = None
+            if isinstance(result, dict):
+                order_id = result.get("orderID") or result.get("id")
+
+            if order_id:
+                filled = await self._wait_for_fill(order_id, timeout=5.0)
+                if not filled:
+                    log.warning("order_not_filled",
+                                order_id=order_id[:20],
+                                side=side,
+                                price=price)
+                    # Cancelar ordem pendente para liberar colateral
+                    await self.cancel_order(order_id)
+                    return None
+                log.info("order_filled",
+                         order_id=order_id[:20],
+                         side=side,
+                         price=price,
+                         size=size)
+
             return result
 
         except Exception as e:
             log.error("order_failed", error=str(e))
             return None
+
+    async def _wait_for_fill(self, order_id: str, timeout: float = 5.0) -> bool:
+        """Poll get_order até fill ou timeout. Retorna True se MATCHED."""
+        clob = self._ensure_clob()
+        loop = asyncio.get_running_loop()
+        start = time.time()
+
+        while time.time() - start < timeout:
+            try:
+                order = await loop.run_in_executor(
+                    None, clob.get_order, order_id
+                )
+                status = ""
+                if isinstance(order, dict):
+                    status = order.get("status", "")
+                    size_matched = float(order.get("size_matched", 0))
+                elif hasattr(order, "status"):
+                    status = order.status
+                    size_matched = float(getattr(order, "size_matched", 0))
+                else:
+                    status = str(order)
+                    size_matched = 0
+
+                if status == "MATCHED" or size_matched > 0:
+                    return True
+                if status in ("CANCELLED", "EXPIRED"):
+                    return False
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        return False
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancela uma ordem pendente."""

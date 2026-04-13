@@ -139,9 +139,9 @@ def calculate_bet_size(
         return 3  # Após 2+ losses, sizing reduzido
 
     if trend_strength >= 2:
-        return 10  # Trend 2/3+ = $10 (16+ shares, SELL sempre funciona)
+        return 6  # Trend 2/3+ = $6
 
-    return 5  # Trend fraca = $5
+    return 4  # Trend fraca = $4
 
 
 def sizing_breakdown(

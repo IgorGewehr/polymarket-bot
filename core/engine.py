@@ -67,6 +67,7 @@ class TradingEngine:
         self.current_position: Position | None = None
         self.current_market: dict | None = None
         self.running = False
+        self._cycle_exited: str = ""  # Market ID do ciclo onde já saímos — bloqueia re-entry
 
     async def start(self):
         """Inicializa conexões e inicia o loop principal."""
@@ -193,6 +194,7 @@ class TradingEngine:
 
         if best and best != self.current_market:
             self.current_market = best
+            self._cycle_exited = ""  # Novo ciclo → reset re-entry block
             self.share_buffer.clear()
             up_token = self._get_yes_token(best)
             down_token = self._get_no_token(best)
@@ -247,6 +249,11 @@ class TradingEngine:
                 btc_price=self.btc_feed.last_price,
             )
 
+        # Bloquear re-entry no mesmo ciclo (dados: re-entry multiplica losses)
+        market_id = market.get("conditionId", market.get("condition_id", ""))
+        if self._cycle_exited and self._cycle_exited == market_id:
+            return
+
         # Risk check
         can_trade, reason = self.risk_manager.can_trade()
         if not can_trade:
@@ -293,6 +300,25 @@ class TradingEngine:
         else:
             market_trend = "Down"
             market_price = no_price
+
+        # ── 2b. Delta acceleration check ──
+        # Delta alto E caindo = momentum enfraquecendo → possível reversão
+        # Não bloqueia (bons trades acontecem em delta <10), mas reduz sizing
+        share_prices = self.share_buffer.get_prices()
+        delta_falling = False
+        current_delta = 0.0
+        if len(share_prices) >= 6:
+            current_delta = abs(share_prices[-1] - share_prices[0]) * 10000
+            # Calcular delta de 3 ticks atrás
+            mid = len(share_prices) // 2
+            past_delta = abs(share_prices[mid] - share_prices[0]) * 10000
+            # Delta estava alto (>40) e agora caiu → momentum revertendo
+            if past_delta > 40 and current_delta < past_delta * 0.7:
+                delta_falling = True
+                log.info("delta_falling",
+                         current=f"{current_delta:.0f}",
+                         past=f"{past_delta:.0f}",
+                         msg="Momentum enfraquecendo, sizing reduzido")
 
         # ── 3. Decisão de entrada ──
 
@@ -388,6 +414,11 @@ class TradingEngine:
             trend_strength=trend_strength,
         )
 
+        # Delta caindo de alto → reduzir sizing pela metade
+        if delta_falling and bet_size > 3:
+            bet_size = max(3, bet_size // 2)
+            log.info("sizing_reduced_delta", new_size=f"${bet_size}")
+
         # ── EXECUTAR TRADE ──
         token_id = self._get_yes_token(market) if direction == "Up" \
             else self._get_no_token(market)
@@ -465,6 +496,11 @@ class TradingEngine:
             yes_price=yes_price,
             btc_price=self.btc_feed.last_price,
         )
+
+        # Bloquear re-entry no mesmo ciclo
+        market_id = market.get("conditionId", market.get("condition_id", ""))
+        if self._cycle_exited and self._cycle_exited == market_id:
+            return
 
         # Risk check
         can_trade, reason = self.risk_manager.can_trade()
@@ -562,6 +598,11 @@ class TradingEngine:
         # Sempre avaliar, mesmo com lock ou hedge ativo
         current_delta = abs(self._calculate_delta(yes_price)) if yes_price > 0 else 0
         if yes_price > 0:
+            # Trackear menor preço visto (para recovery check no stop loss)
+            our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
+            if not hasattr(pos, '_lowest_price') or our_price < pos._lowest_price:
+                pos._lowest_price = our_price
+
             exit_eval = evaluate_early_exit(
                 direction=pos.direction,
                 entry_price=pos.entry_price,
@@ -570,6 +611,7 @@ class TradingEngine:
                 current_yes_price=yes_price,
                 time_remaining=time_remaining,
                 current_delta=current_delta,
+                lowest_price_seen=getattr(pos, '_lowest_price', 0.0),
             )
 
             # Log avaliação a cada 30s para debug
@@ -626,6 +668,7 @@ class TradingEngine:
                         pass
 
                     self.cycle_collector.end_cycle(yes_price, pnl)
+                    self._cycle_exited = pos.market_id  # Bloquear re-entry neste ciclo
                     self.current_position = None
                     self.share_buffer.clear()
                     return

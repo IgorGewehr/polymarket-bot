@@ -1,11 +1,15 @@
 """
-Early Exit — Safety Sell, Delta Guard, Take Profit e Stop Loss.
+Early Exit — Safety Sell, Delta Guard, Take Profit e Stop Loss com Time Gate.
 
 Prioridade:
-1. Safety Sell: share >= $0.80 com < 2min → vender (lucro quase certo)
-2. Delta Guard: delta < 10 nos últimos 60s com lucro → vender (50/50 não vale o risco)
-3. Take Profit: ganho >= 30% E vender > hold_ev → vender
-4. Stop Loss: preço caiu 35%+ do entry → vender para limitar loss
+1. Emergency: share < $0.20 → vender SEMPRE
+2. Safety Sell: share >= $0.85 com < 200s → vender
+3. Delta Guard: delta < 10 nos últimos 60s com lucro → vender
+4. Take Profit: ganho >= 40% E vender > hold_ev → vender
+5. EV Optimal: ganho >= 25% E vender > hold_ev × 1.30 → vender
+6. Stop Loss: preço caiu 35%+ — MAS com time gate inteligente:
+   - Antes de 2:30 restantes: NÃO vender (mercado pode reverter)
+   - Depois de 2:30: vender, a menos que preço esteja RECUPERANDO do fundo
 """
 import structlog
 from dataclasses import dataclass
@@ -23,6 +27,10 @@ SAFETY_SELL_TIME = 200         # Ativar depois dos primeiros 100s de monitoramen
 # Delta guard: mercado indeciso perto do fim → vender se tem lucro
 DELTA_GUARD_THRESHOLD = 10     # Delta < 10 = indeciso
 DELTA_GUARD_TIME = 60          # Nos últimos 60s
+
+# Stop loss time gate
+SL_TIME_GATE = 150             # 2:30 restantes — antes disso, não panic sell
+SL_RECOVERY_THRESHOLD = 0.10   # Se preço recuperou 10%+ do fundo, segurar mais
 
 
 @dataclass
@@ -44,12 +52,14 @@ def evaluate_early_exit(
     current_yes_price: float,
     time_remaining: float,
     current_delta: float = 0.0,
+    lowest_price_seen: float = 0.0,
 ) -> ExitEvaluation:
     """
     Avalia se vale vender shares agora.
 
     Args:
         current_delta: delta absoluto atual do ciclo (para delta guard)
+        lowest_price_seen: menor preço da nossa share desde entry (para recovery check)
     """
     # Preço bid das NOSSAS shares
     if direction == "Up":
@@ -81,34 +91,54 @@ def evaluate_early_exit(
     if time_remaining < 10:
         return no_exit
 
-    # ── 1. SAFETY SELL — share muito alta → vender ──
-    # Share >= $0.85 → max upside é $0.15/share, não vale o risco de reversão
+    # ── 1. EMERGENCY SELL — share abaixo de $0.20 → vender SEMPRE ──
+    if bid_price < 0.20:
+        return ExitEvaluation(True, "emergency", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
+    # ── 2. SAFETY SELL — share muito alta → vender ──
     if bid_price >= SAFETY_SELL_PRICE and time_remaining < SAFETY_SELL_TIME:
         return ExitEvaluation(True, "safety_sell", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 2. DELTA GUARD — mercado indeciso nos últimos 60s ──
-    # Delta < 10 = 50/50, se temos lucro → vender
+    # ── 3. DELTA GUARD — mercado indeciso nos últimos 60s ──
     if (time_remaining < DELTA_GUARD_TIME
             and abs(current_delta) < DELTA_GUARD_THRESHOLD
             and sell_pnl > 0):
         return ExitEvaluation(True, "delta_guard", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 3. EMERGENCY SELL — share abaixo de $0.20 → vender IMEDIATAMENTE ──
-    if bid_price < 0.20:
-        return ExitEvaluation(True, "emergency", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
-
-    # ── 4. STOP LOSS — preço caiu demais (ativa SEMPRE, sem restrição de tempo) ──
-    price_drop = (entry_price - bid_price) / entry_price if entry_price > 0 else 0
-    if price_drop >= STOP_LOSS_THRESHOLD_PCT:
-        return ExitEvaluation(True, "stop_loss", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
-
-    # ── 4. TAKE PROFIT — ganho bom (ativa SEMPRE, sem restrição de tempo) ──
+    # ── 4. TAKE PROFIT — ganho bom (ativa SEMPRE) ──
     if gain_pct >= TAKE_PROFIT_MIN_GAIN_PCT and sell_pnl > hold_ev:
         return ExitEvaluation(True, "take_profit", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
     # ── 5. EV PURO — vender é significativamente melhor ──
-    # Só ativar com gain mínimo de 25% (dar espaço para o trade crescer)
     if gain_pct >= 0.25 and sell_pnl > 0 and sell_pnl > hold_ev * 1.30:
         return ExitEvaluation(True, "ev_optimal", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
+    # ── 6. STOP LOSS com TIME GATE inteligente ──
+    price_drop = (entry_price - bid_price) / entry_price if entry_price > 0 else 0
+    if price_drop >= STOP_LOSS_THRESHOLD_PCT:
+
+        # Antes de 2:30 restantes → NÃO panic sell, mercado pode reverter
+        if time_remaining > SL_TIME_GATE:
+            log.info("sl_held_timegate",
+                     drop=f"{price_drop:.0%}",
+                     price=f"${bid_price:.2f}",
+                     remaining=f"{time_remaining:.0f}s",
+                     msg="SL trigou mas antes de 2:30, segurando")
+            return no_exit
+
+        # Depois de 2:30: checar se preço está RECUPERANDO do fundo
+        if lowest_price_seen > 0 and bid_price > lowest_price_seen:
+            recovery = (bid_price - lowest_price_seen) / lowest_price_seen
+            if recovery >= SL_RECOVERY_THRESHOLD:
+                log.info("sl_held_recovery",
+                         drop=f"{price_drop:.0%}",
+                         price=f"${bid_price:.2f}",
+                         low=f"${lowest_price_seen:.2f}",
+                         recovery=f"{recovery:.0%}",
+                         msg="Preço recuperando do fundo, segurando")
+                return no_exit
+
+        # Sem recovery, tempo acabando → vender
+        return ExitEvaluation(True, "stop_loss", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
     return no_exit

@@ -151,3 +151,12 @@ async def resume_bot():
         _engine.running = True
         return {"status": "resumed"}
     return {"error": "Engine not initialized"}
+
+
+@app.post("/api/unlock")
+async def unlock_bot():
+    """Destrava o bot após lock por 3 losses consecutivos."""
+    if _engine:
+        _engine.risk_manager.unlock()
+        return {"status": "unlocked", "msg": "Bot destravado, pode operar novamente"}
+    return {"error": "Engine not initialized"}

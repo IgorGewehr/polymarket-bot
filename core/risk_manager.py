@@ -68,23 +68,26 @@ class RiskManager:
         if s.is_stopped:
             return False, s.stop_reason
 
-        # Cooldown após 3 losses consecutivos (pausa temporária)
+        # 3 losses consecutivos → TRAVA até destravamento manual
         if s.consecutive_losses >= 3:
-            if s.cooldown_until == 0:
-                s.cooldown_until = time.time() + COOLDOWN_SECONDS
-                log.warning("cooldown_activated",
-                            consecutive_losses=s.consecutive_losses,
-                            duration=COOLDOWN_SECONDS)
-
-        if s.cooldown_until > 0 and time.time() < s.cooldown_until:
-            remaining = int(s.cooldown_until - time.time())
-            return False, f"Cooldown ativo ({remaining}s restantes)"
-        elif s.cooldown_until > 0 and time.time() >= s.cooldown_until:
-            s.cooldown_until = 0
-            s.consecutive_losses = 0
-            log.info("cooldown_ended")
+            s.is_stopped = True
+            s.stop_reason = (
+                f"TRAVADO: {s.consecutive_losses} losses consecutivos. "
+                f"Destrave manualmente via dashboard ou restart."
+            )
+            log.error("manual_lock_activated",
+                       consecutive_losses=s.consecutive_losses,
+                       pnl_today=f"${s.pnl_today:.2f}")
+            return False, s.stop_reason
 
         return True, "OK"
+
+    def unlock(self):
+        """Destrava o bot manualmente após lock por losses consecutivos."""
+        self.state.is_stopped = False
+        self.state.stop_reason = ""
+        self.state.consecutive_losses = 0
+        log.info("manual_unlock", msg="Bot destravado manualmente")
 
     def update(self, pnl: float):
         """Atualiza estado após resultado de um trade."""
