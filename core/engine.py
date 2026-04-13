@@ -26,7 +26,7 @@ from data.feeds import BinanceFeed, PolymarketFeed, PolymarketREST
 from data.storage import Storage
 from data.cycle_collector import CycleCollector
 from core.lock_profit import evaluate_lock
-from core.early_exit import evaluate_early_exit
+from core.early_exit import evaluate_early_exit, ExitEvaluation
 from execution.order_client import OrderClient, execute_trade, execute_hedge, execute_sell, execute_lock
 from monitoring.notifier import TelegramNotifier
 
@@ -628,6 +628,8 @@ class TradingEngine:
                 sell_qty = pos._limit_sell_qty
                 sell_price = pos._limit_sell_price
                 pnl = sell_qty * sell_price * (1 - 0.0315) - pos.bet_size
+                if pos.has_hedge:
+                    pnl -= pos.hedge_cost
                 pos.exited_early = True
                 pos.exit_price = sell_price
                 pos.exit_reason = "limit_sell_filled"
@@ -656,26 +658,7 @@ class TradingEngine:
                          our_price=f"${our_price:.2f}",
                          msg="Share > $0.75, cancelando limit pra capturar big win")
 
-        # ── 0c. CHECK RECOVERY SELL FILL ($0.48) ──
-        if getattr(pos, '_recovery_sell_pending', False) and getattr(pos, '_recovery_sell_order_id', None):
-            filled = await self.order_client._wait_for_fill(pos._recovery_sell_order_id, timeout=0.5)
-            if filled:
-                sell_qty = pos._recovery_sell_qty
-                pnl = sell_qty * 0.48 * (1 - 0.0315) - pos.bet_size
-                pos.exited_early = True
-                pos.exit_price = 0.48
-                pos.exit_reason = "sl_recovery_filled"
-                pos._recovery_sell_pending = False
-                self.risk_manager.update(pnl)
-                log.info("sl_recovery_filled",
-                         pnl=f"${pnl:+.2f}",
-                         price="$0.48",
-                         msg="Recovery sell preencheu a $0.48!")
-                self._cycle_exited = pos.market_id
-                self.cycle_collector.end_cycle(yes_price, pnl)
-                self.current_position = None
-                self.share_buffer.clear()
-                return
+        # (recovery sell antigo removido — substituído por trailing stop)
 
         # ── 1. EARLY EXIT (safety sell / delta guard / TP / EV) ──
         # Só avalia exits de LUCRO. Stop loss foi substituído por recovery sell.
@@ -713,33 +696,55 @@ class TradingEngine:
 
             if exit_eval.should_exit:
 
-                # ── SL RECOVERY SELL: colocar limit a $0.48, esperar fill ──
-                if exit_eval.reason == "sl_recovery_sell":
-                    # Só colocar a order UMA VEZ (não repetir a cada tick)
-                    if not getattr(pos, '_recovery_sell_pending', False):
-                        sell_qty = round(pos.shares * 0.95, 2)
-                        # Colocar SELL a $0.48 no book (sem fill check — fica esperando)
-                        order = await self.order_client.place_order(
-                            token_id=pos.token_id,
-                            side="SELL",
-                            price=0.48,
-                            size=sell_qty,
-                            fee_rate_bps=1000,
-                        )
-                        if order:
-                            # Extrair order ID para cancelar depois se necessário
-                            oid = None
-                            if isinstance(order, dict):
-                                oid = order.get("orderID") or order.get("id")
-                            pos._recovery_sell_pending = True
-                            pos._recovery_sell_order_id = oid
-                            pos._recovery_sell_qty = sell_qty
-                            log.info("sl_recovery_sell_posted",
-                                     price="$0.48",
-                                     qty=sell_qty,
-                                     msg="Limit sell a $0.48 no book, esperando fill até 2min")
-                    # Não fechar posição agora — esperar fill ou timeout
-                    return
+                # ── RECOVERY ZONE: trailing stop com floor $0.48 ──
+                if exit_eval.reason == "recovery_zone":
+                    our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
+
+                    # Inicializar trailing se ainda não existe
+                    if not hasattr(pos, '_recovery_trailing_active'):
+                        pos._recovery_trailing_active = False
+                        pos._recovery_high = 0.0
+
+                    if our_price >= 0.48:
+                        # Preço voltou a $0.48+ → ativar trailing stop
+                        if not pos._recovery_trailing_active:
+                            pos._recovery_trailing_active = True
+                            pos._recovery_high = our_price
+                            log.info("trailing_stop_activated",
+                                     price=f"${our_price:.2f}",
+                                     msg="Preço recuperou a $0.48+, trailing ativo!")
+
+                        # Atualizar high
+                        pos._recovery_high = max(pos._recovery_high, our_price)
+
+                        # Vender se caiu 12% do pico da recovery (floor $0.48)
+                        trail_trigger = pos._recovery_high * 0.88
+                        trail_trigger = max(trail_trigger, 0.48)  # floor
+
+                        if our_price <= trail_trigger and pos._recovery_high > 0.50:
+                            log.info("trailing_stop_triggered",
+                                     price=f"${our_price:.2f}",
+                                     high=f"${pos._recovery_high:.2f}",
+                                     trigger=f"${trail_trigger:.2f}",
+                                     msg="Trailing stop! Vendendo no bounce")
+                            # Não retornar — deixar cair pro SELL normal abaixo
+                            exit_eval = ExitEvaluation(
+                                True, "trailing_recovery",
+                                our_price,
+                                pos.shares * our_price * (1 - 0.0315),
+                                pos.shares * our_price * (1 - 0.0315) - pos.bet_size,
+                                0, (our_price - pos.entry_price) / pos.entry_price
+                            )
+                        else:
+                            # Trailing ativo mas preço ainda subindo — segurar
+                            return
+                    else:
+                        # Preço ainda abaixo de $0.48 — esperar recovery
+                        if int(time_remaining) % 30 < 3:
+                            log.info("waiting_recovery",
+                                     price=f"${our_price:.2f}",
+                                     remaining=f"{time_remaining:.0f}s")
+                        return
 
                 # ── SELL normal (TP, EV optimal, safety sell, delta guard) ──
                 # Cancelar limit sells pendentes antes de vender no market
@@ -772,6 +777,9 @@ class TradingEngine:
 
                 if order:
                     pnl = exit_eval.sell_pnl
+                    # Contabilizar custo do hedge (se existir)
+                    if pos.has_hedge:
+                        pnl -= pos.hedge_cost
                     pos.exited_early = True
                     pos.exit_price = exit_eval.sell_price
                     pos.exit_proceeds = exit_eval.sell_proceeds
@@ -783,6 +791,7 @@ class TradingEngine:
                              pnl=f"${pnl:+.2f}",
                              sell=f"${exit_eval.sell_price:.2f}",
                              entry=f"${pos.entry_price:.2f}",
+                             hedge_cost=f"${pos.hedge_cost:.2f}" if pos.has_hedge else "none",
                              gain=f"{exit_eval.gain_pct:.0%}")
 
                     try:

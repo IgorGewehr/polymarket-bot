@@ -113,18 +113,21 @@ def evaluate_early_exit(
     if gain_pct >= 0.25 and sell_pnl > 0 and sell_pnl > hold_ev * 1.30:
         return ExitEvaluation(True, "ev_optimal", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 6. RECOVERY SELL — sem panic sell, só limit a $0.48 no book ──
-    # Se perdendo: posta limit sell a $0.48 e espera. Se não preencher, segura até resolução.
-    # NUNCA vende no mercado a preço ruim. O mercado sempre oscila.
+    # ── 6. TRAILING STOP NA RECOVERY ──
+    # Quando perdendo: esperar preço voltar a $0.48+.
+    # Quando chegar em $0.48, ativar trailing stop com floor $0.48.
+    # Trailing: vende quando cair 12% do pico da recovery.
+    # Se nunca chegar em $0.48 → segura até resolução.
+    #
+    # Lógica é sinalizada aqui e executada no engine via _recovery_trailing.
+
     price_drop = (entry_price - bid_price) / entry_price if entry_price > 0 else 0
     if price_drop >= STOP_LOSS_THRESHOLD_PCT:
-        recovery_price = 0.48
-        recovery_proceeds = shares * recovery_price * (1 - TAKER_FEE_PCT)
-        recovery_pnl = recovery_proceeds - cost_basis
-        recovery_gain = (recovery_price - entry_price) / entry_price if entry_price > 0 else 0
+        # Sinalizar pro engine que estamos em zona de recovery
+        # Engine decide se ativa trailing ou espera
         return ExitEvaluation(
-            True, "sl_recovery_sell", recovery_price,
-            recovery_proceeds, recovery_pnl, hold_ev, recovery_gain
+            True, "recovery_zone", bid_price,
+            sell_proceeds, sell_pnl, hold_ev, gain_pct
         )
 
     return no_exit
