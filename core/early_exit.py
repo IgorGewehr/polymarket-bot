@@ -1,15 +1,16 @@
 """
-Early Exit — Safety Sell, Delta Guard, Take Profit e Stop Loss com Time Gate.
+Early Exit — só sai com lucro ou via recovery sell.
 
-Prioridade:
-1. Emergency: share < $0.20 → vender SEMPRE
-2. Safety Sell: share >= $0.85 com < 200s → vender
-3. Delta Guard: delta < 10 nos últimos 60s com lucro → vender
-4. Take Profit: ganho >= 40% E vender > hold_ev → vender
-5. EV Optimal: ganho >= 25% E vender > hold_ev × 1.30 → vender
-6. Stop Loss: preço caiu 35%+ — MAS com time gate inteligente:
-   - Antes de 2:30 restantes: NÃO vender (mercado pode reverter)
-   - Depois de 2:30: vender, a menos que preço esteja RECUPERANDO do fundo
+Prioridade (só quando GANHANDO):
+1. Safety Sell: share >= $0.85 → vender
+2. Delta Guard: delta < 10 nos últimos 60s com lucro → vender
+3. Take Profit: ganho >= 40% → vender
+4. EV Optimal: ganho >= 25% e matematicamente melhor → vender
+
+Quando PERDENDO:
+- Recovery sell: limit order a $0.48 no book, espera fill
+- Se não preencher: segura até resolução (50/50)
+- NUNCA vende no mercado a preço ruim
 """
 import structlog
 from dataclasses import dataclass
@@ -91,9 +92,8 @@ def evaluate_early_exit(
     if time_remaining < 10:
         return no_exit
 
-    # ── 1. EMERGENCY SELL — share abaixo de $0.20 → vender SEMPRE ──
-    if bid_price < 0.20:
-        return ExitEvaluation(True, "emergency", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+    # Emergency sell removido — mercado volátil bate $0.18 e volta $0.50 no mesmo ciclo
+    # Recovery sell + hold to resolution protegem melhor que panic sell a $0.18
 
     # ── 2. SAFETY SELL — share muito alta → vender ──
     if bid_price >= SAFETY_SELL_PRICE and time_remaining < SAFETY_SELL_TIME:
@@ -113,32 +113,18 @@ def evaluate_early_exit(
     if gain_pct >= 0.25 and sell_pnl > 0 and sell_pnl > hold_ev * 1.30:
         return ExitEvaluation(True, "ev_optimal", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 6. STOP LOSS com TIME GATE inteligente ──
+    # ── 6. RECOVERY SELL — sem panic sell, só limit a $0.48 no book ──
+    # Se perdendo: posta limit sell a $0.48 e espera. Se não preencher, segura até resolução.
+    # NUNCA vende no mercado a preço ruim. O mercado sempre oscila.
     price_drop = (entry_price - bid_price) / entry_price if entry_price > 0 else 0
     if price_drop >= STOP_LOSS_THRESHOLD_PCT:
-
-        # Antes de 2:30 restantes → NÃO panic sell, mercado pode reverter
-        if time_remaining > SL_TIME_GATE:
-            log.info("sl_held_timegate",
-                     drop=f"{price_drop:.0%}",
-                     price=f"${bid_price:.2f}",
-                     remaining=f"{time_remaining:.0f}s",
-                     msg="SL trigou mas antes de 2:30, segurando")
-            return no_exit
-
-        # Depois de 2:30: checar se preço está RECUPERANDO do fundo
-        if lowest_price_seen > 0 and bid_price > lowest_price_seen:
-            recovery = (bid_price - lowest_price_seen) / lowest_price_seen
-            if recovery >= SL_RECOVERY_THRESHOLD:
-                log.info("sl_held_recovery",
-                         drop=f"{price_drop:.0%}",
-                         price=f"${bid_price:.2f}",
-                         low=f"${lowest_price_seen:.2f}",
-                         recovery=f"{recovery:.0%}",
-                         msg="Preço recuperando do fundo, segurando")
-                return no_exit
-
-        # Sem recovery, tempo acabando → vender
-        return ExitEvaluation(True, "stop_loss", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+        recovery_price = 0.48
+        recovery_proceeds = shares * recovery_price * (1 - TAKER_FEE_PCT)
+        recovery_pnl = recovery_proceeds - cost_basis
+        recovery_gain = (recovery_price - entry_price) / entry_price if entry_price > 0 else 0
+        return ExitEvaluation(
+            True, "sl_recovery_sell", recovery_price,
+            recovery_proceeds, recovery_pnl, hold_ev, recovery_gain
+        )
 
     return no_exit

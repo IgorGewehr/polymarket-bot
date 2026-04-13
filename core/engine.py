@@ -331,7 +331,7 @@ class TradingEngine:
                 return
             else:
                 # Deadline: seguir o mercado
-                if 0.50 <= market_price <= 0.62:
+                if 0.48 <= market_price <= 0.65:
                     direction = market_trend
                     entry_price = market_price
                     log.info("entry_deadline_neutral",
@@ -342,7 +342,7 @@ class TradingEngine:
                     return
 
         # BTC trend e mercado CONCORDAM + preço na faixa → ENTRAR
-        elif btc_trend == market_trend and 0.50 <= market_price <= 0.62:
+        elif btc_trend == market_trend and 0.48 <= market_price <= 0.65:
             direction = market_trend
             entry_price = market_price
             log.info("entry_aligned",
@@ -363,7 +363,7 @@ class TradingEngine:
                 return
             else:
                 # Deadline: seguir mercado
-                if 0.50 <= market_price <= 0.62:
+                if 0.48 <= market_price <= 0.65:
                     direction = market_trend
                     entry_price = market_price
                     log.info("entry_deadline",
@@ -375,7 +375,7 @@ class TradingEngine:
                     return
 
         # Preço fora da faixa
-        elif not (0.50 <= market_price <= 0.62):
+        elif not (0.48 <= market_price <= 0.65):
             log.info("skip_price_range",
                      price=f"${market_price:.2f}")
             return
@@ -408,6 +408,7 @@ class TradingEngine:
             time_remaining=time_remaining,
             direction=direction,
             consecutive_losses=self.risk_manager.state.consecutive_losses,
+            consecutive_wins=self.risk_manager.state.consecutive_wins,
             is_drawdown=self.risk_manager.is_drawdown,
             is_squeeze_breakout=analysis.is_squeeze_breakout if analysis else False,
             entry_price=entry_price,
@@ -447,6 +448,32 @@ class TradingEngine:
                 entry_alignment=int(analysis.layer2_alignment)
             )
 
+            # ── LIMIT SELL IMEDIATO a entry + $0.13 ──
+            # Captura oscilação natural. 63% dos trades preenchem antes da resolução.
+            target_price = round(entry_price + 0.13, 2)
+            target_price = min(target_price, 0.99)
+            sell_qty = round(shares * 0.95, 2)
+            limit_order = await self.order_client.place_order(
+                token_id=token_id,
+                side="SELL",
+                price=target_price,
+                size=sell_qty,
+                fee_rate_bps=1000,
+            )
+            if limit_order:
+                oid = None
+                if isinstance(limit_order, dict):
+                    oid = limit_order.get("orderID") or limit_order.get("id")
+                self.current_position._limit_sell_id = oid
+                self.current_position._limit_sell_price = target_price
+                self.current_position._limit_sell_qty = sell_qty
+                self.current_position._limit_sell_active = True
+                log.info("limit_sell_posted",
+                         target=f"${target_price:.2f}",
+                         entry=f"${entry_price:.2f}",
+                         profit=f"${0.13 * shares:.2f}",
+                         shares=f"{sell_qty:.1f}")
+
             self.cycle_collector.record_trade(
                 direction=direction,
                 size=bet_size,
@@ -458,6 +485,7 @@ class TradingEngine:
                      size=f"${bet_size}",
                      price=f"${entry_price:.2f}",
                      ret=f"{expected_return:.0%}",
+                     streak=f"W{self.risk_manager.state.consecutive_wins}",
                      time_slot=get_time_slot(time_remaining))
 
             await self.notifier.notify_trade(
@@ -508,11 +536,10 @@ class TradingEngine:
             return
 
         # Só entrar se a share SAIU do range indeciso
-        # Se ainda está $0.45-$0.55, continuar esperando
-        if 0.55 < yes_price <= 0.62:
+        if 0.55 < yes_price <= 0.65:
             direction = "Up"
             entry_price = yes_price
-        elif 0.55 < no_price <= 0.62:
+        elif 0.55 < no_price <= 0.65:
             direction = "Down"
             entry_price = no_price
         else:
@@ -526,13 +553,13 @@ class TradingEngine:
                  ret=f"{expected_return:.0%}",
                  remaining=f"{time_remaining:.0f}s")
 
-        # Sizing $3 para ter 5+ shares (habilita early exit)
         bet_size = calculate_bet_size(
             confidence=0.0,
             expected_return=expected_return,
             time_remaining=time_remaining,
             direction=direction,
             consecutive_losses=self.risk_manager.state.consecutive_losses,
+            consecutive_wins=self.risk_manager.state.consecutive_wins,
             is_drawdown=self.risk_manager.is_drawdown,
             entry_price=entry_price,
             trend_strength=2,
@@ -594,8 +621,64 @@ class TradingEngine:
         if not pos or pos.exited_early:
             return
 
-        # ── 1. EARLY EXIT (safety sell / delta guard / TP / SL) ──
-        # Sempre avaliar, mesmo com lock ou hedge ativo
+        # ── 0. CHECK LIMIT SELL FILL (entry + $0.13) ──
+        if getattr(pos, '_limit_sell_active', False) and getattr(pos, '_limit_sell_id', None):
+            filled = await self.order_client._wait_for_fill(pos._limit_sell_id, timeout=0.5)
+            if filled:
+                sell_qty = pos._limit_sell_qty
+                sell_price = pos._limit_sell_price
+                pnl = sell_qty * sell_price * (1 - 0.0315) - pos.bet_size
+                pos.exited_early = True
+                pos.exit_price = sell_price
+                pos.exit_reason = "limit_sell_filled"
+                pos._limit_sell_active = False
+                self.risk_manager.update(pnl)
+                log.info("limit_sell_filled",
+                         pnl=f"${pnl:+.2f}",
+                         price=f"${sell_price:.2f}",
+                         entry=f"${pos.entry_price:.2f}",
+                         msg="Limit sell preencheu!")
+                self._cycle_exited = pos.market_id
+                self.cycle_collector.end_cycle(yes_price, pnl)
+                self.current_position = None
+                self.share_buffer.clear()
+                return
+
+        # ── 0b. HÍBRIDO: se share > $0.75, cancelar limit sell e deixar TP capturar big win ──
+        if getattr(pos, '_limit_sell_active', False) and yes_price > 0:
+            our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
+            if our_price >= 0.75:
+                # Mercado indo muito bem — cancelar limit conservador, mirar alto
+                if getattr(pos, '_limit_sell_id', None):
+                    await self.order_client.cancel_order(pos._limit_sell_id)
+                pos._limit_sell_active = False
+                log.info("limit_sell_cancelled_for_tp",
+                         our_price=f"${our_price:.2f}",
+                         msg="Share > $0.75, cancelando limit pra capturar big win")
+
+        # ── 0c. CHECK RECOVERY SELL FILL ($0.48) ──
+        if getattr(pos, '_recovery_sell_pending', False) and getattr(pos, '_recovery_sell_order_id', None):
+            filled = await self.order_client._wait_for_fill(pos._recovery_sell_order_id, timeout=0.5)
+            if filled:
+                sell_qty = pos._recovery_sell_qty
+                pnl = sell_qty * 0.48 * (1 - 0.0315) - pos.bet_size
+                pos.exited_early = True
+                pos.exit_price = 0.48
+                pos.exit_reason = "sl_recovery_filled"
+                pos._recovery_sell_pending = False
+                self.risk_manager.update(pnl)
+                log.info("sl_recovery_filled",
+                         pnl=f"${pnl:+.2f}",
+                         price="$0.48",
+                         msg="Recovery sell preencheu a $0.48!")
+                self._cycle_exited = pos.market_id
+                self.cycle_collector.end_cycle(yes_price, pnl)
+                self.current_position = None
+                self.share_buffer.clear()
+                return
+
+        # ── 1. EARLY EXIT (safety sell / delta guard / TP / EV) ──
+        # Só avalia exits de LUCRO. Stop loss foi substituído por recovery sell.
         current_delta = abs(self._calculate_delta(yes_price)) if yes_price > 0 else 0
         if yes_price > 0:
             # Trackear menor preço visto (para recovery check no stop loss)
@@ -629,7 +712,44 @@ class TradingEngine:
                          remaining=f"{time_remaining:.0f}s")
 
             if exit_eval.should_exit:
-                # Vender todas as shares — retry com quantidade menor se falhar
+
+                # ── SL RECOVERY SELL: colocar limit a $0.48, esperar fill ──
+                if exit_eval.reason == "sl_recovery_sell":
+                    # Só colocar a order UMA VEZ (não repetir a cada tick)
+                    if not getattr(pos, '_recovery_sell_pending', False):
+                        sell_qty = round(pos.shares * 0.95, 2)
+                        # Colocar SELL a $0.48 no book (sem fill check — fica esperando)
+                        order = await self.order_client.place_order(
+                            token_id=pos.token_id,
+                            side="SELL",
+                            price=0.48,
+                            size=sell_qty,
+                            fee_rate_bps=1000,
+                        )
+                        if order:
+                            # Extrair order ID para cancelar depois se necessário
+                            oid = None
+                            if isinstance(order, dict):
+                                oid = order.get("orderID") or order.get("id")
+                            pos._recovery_sell_pending = True
+                            pos._recovery_sell_order_id = oid
+                            pos._recovery_sell_qty = sell_qty
+                            log.info("sl_recovery_sell_posted",
+                                     price="$0.48",
+                                     qty=sell_qty,
+                                     msg="Limit sell a $0.48 no book, esperando fill até 2min")
+                    # Não fechar posição agora — esperar fill ou timeout
+                    return
+
+                # ── SELL normal (TP, EV optimal, safety sell, delta guard) ──
+                # Cancelar limit sells pendentes antes de vender no market
+                if getattr(pos, '_limit_sell_active', False) and getattr(pos, '_limit_sell_id', None):
+                    await self.order_client.cancel_order(pos._limit_sell_id)
+                    pos._limit_sell_active = False
+                if getattr(pos, '_recovery_sell_pending', False) and getattr(pos, '_recovery_sell_order_id', None):
+                    await self.order_client.cancel_order(pos._recovery_sell_order_id)
+                    pos._recovery_sell_pending = False
+
                 order = None
                 for pct in [1.0, 0.95, 0.90, 0.85]:
                     sell_qty = round(pos.shares * pct, 2)
@@ -643,6 +763,13 @@ class TradingEngine:
                                  price=f"${exit_eval.sell_price:.2f}",
                                  pct=f"{pct:.0%}")
                         break
+
+                # Se tem recovery sell pendente e agora estamos vendendo de verdade, cancelar
+                if getattr(pos, '_recovery_sell_pending', False) and pos._recovery_sell_order_id:
+                    await self.order_client.cancel_order(pos._recovery_sell_order_id)
+                    pos._recovery_sell_pending = False
+                    log.info("sl_recovery_cancelled", msg="Recovery sell cancelada, vendendo no mercado")
+
                 if order:
                     pnl = exit_eval.sell_pnl
                     pos.exited_early = True

@@ -108,17 +108,15 @@ def calculate_bet_size(
     time_remaining: float,
     direction: str,
     consecutive_losses: int,
+    consecutive_wins: int = 0,
     is_drawdown: bool = False,
     is_squeeze_breakout: bool = False,
     entry_price: float = 0.50,
     trend_strength: int = 2,
 ) -> int:
     """
-    Calcula o tamanho da aposta ($1, $2, ou $3).
-    Usa Kelly fracionário como base, ajustado por penalidades.
-
-    Returns:
-        Valor da aposta: 1, 2, ou 3
+    Sizing dinâmico: base $6, escala com streak de wins.
+    W2→$8, W3+→$10. Após loss volta pra base.
     """
     # Se em drawdown, forçar sizing mínimo
     if is_drawdown:
@@ -130,18 +128,22 @@ def calculate_bet_size(
         1.0 - (consecutive_losses * LOSS_PENALTY_RATE)
     )
 
-    # Sizing baseado na força da trend + preço da share
-    # $3 = trend forte + preço bom (habilita lock e early exit com 5+ shares)
-    # $2 = trend moderada ou preço alto
-    # $1 = após 2+ losses seguidos
-
     if loss_penalty < 0.6:
-        return 3  # Após 2+ losses, sizing reduzido
+        return 3  # Após 2+ losses
 
+    # Base pela trend strength
     if trend_strength >= 2:
-        return 6  # Trend 2/3+ = $6
+        base = 6
+    else:
+        base = 4
 
-    return 4  # Trend fraca = $4
+    # Streak bonus: capitalizar quando ganhando
+    if consecutive_wins >= 3:
+        base = 10
+    elif consecutive_wins >= 2:
+        base = 8
+
+    return base
 
 
 def sizing_breakdown(
