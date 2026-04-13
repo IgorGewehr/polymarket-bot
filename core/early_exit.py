@@ -91,5 +91,11 @@ def evaluate_early_exit(
             and sell_pnl > 0):
         return ExitEvaluation(True, "delta_guard", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # Stop loss é via limit order no book — não precisa de lógica aqui
+    # ── 5. FALLBACK STOP LOSS — se limit sell no book falhou ──
+    # NUNCA perder mais que 1/3 da aposta. Se share caiu 33%+ do entry, vender.
+    # Isso é backup — normalmente o SL a $0.40 no book já pegou.
+    price_drop = (entry_price - bid_price) / entry_price if entry_price > 0 else 0
+    if price_drop >= 0.33:
+        return ExitEvaluation(True, "fallback_stop_loss", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
     return no_exit
