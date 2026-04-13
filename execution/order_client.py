@@ -114,26 +114,35 @@ class OrderClient:
                      price=price,
                      size=size)
 
-            # ── Verificar fill (poll por até 5s) ──
+            # ── Verificar fill ──
             order_id = None
             if isinstance(result, dict):
                 order_id = result.get("orderID") or result.get("id")
 
             if order_id:
-                filled = await self._wait_for_fill(order_id, timeout=5.0)
-                if not filled:
-                    log.warning("order_not_filled",
-                                order_id=order_id[:20],
-                                side=side,
-                                price=price)
-                    # Cancelar ordem pendente para liberar colateral
-                    await self.cancel_order(order_id)
-                    return None
-                log.info("order_filled",
-                         order_id=order_id[:20],
-                         side=side,
-                         price=price,
-                         size=size)
+                if side.upper() == "BUY":
+                    # BUY: esperar 15s pelo fill, cancelar se não preencher
+                    filled = await self._wait_for_fill(order_id, timeout=15.0)
+                    if not filled:
+                        log.warning("order_not_filled",
+                                    order_id=order_id[:20],
+                                    side=side,
+                                    price=price)
+                        await self.cancel_order(order_id)
+                        return None
+                    log.info("order_filled",
+                             order_id=order_id[:20],
+                             side=side,
+                             price=price,
+                             size=size)
+                else:
+                    # SELL: NÃO fazer fill check — deixar no book como GTC
+                    # Profit sells e stop loss sells ficam esperando fill
+                    log.info("sell_order_posted",
+                             order_id=order_id[:20],
+                             side=side,
+                             price=price,
+                             size=size)
 
             return result
 

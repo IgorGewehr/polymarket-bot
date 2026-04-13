@@ -128,8 +128,8 @@ def calculate_bet_size(
         1.0 - (consecutive_losses * LOSS_PENALTY_RATE)
     )
 
-    # $6 fixo. Sem escalada. Consistência > ambição.
-    return 6
+    # $5 fixo. Sem escalada. Consistência > ambição.
+    return 5
 
 
 def sizing_breakdown(
