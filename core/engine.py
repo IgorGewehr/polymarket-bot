@@ -629,7 +629,7 @@ class TradingEngine:
             })
 
     async def _phase_monitor(self, market: dict, time_remaining: float):
-        """Fase de monitoramento: early exit → lock profit → hedge."""
+        """Fase de monitoramento: só exits de LUCRO. Perdendo = hold to resolution."""
         # Snapshots para Excel
         yes_price = self.poly_feed.yes_price
         if yes_price > 0:
@@ -652,8 +652,6 @@ class TradingEngine:
                 sell_qty = pos._limit_sell_qty
                 sell_price = pos._limit_sell_price
                 pnl = sell_qty * sell_price * (1 - 0.0315) - pos.bet_size
-                if pos.has_hedge:
-                    pnl -= pos.hedge_cost
                 pos.exited_early = True
                 pos.exit_price = sell_price
                 pos.exit_reason = "limit_sell_filled"
@@ -670,11 +668,10 @@ class TradingEngine:
                 self.share_buffer.clear()
                 return
 
-        # ── 0b. HÍBRIDO: se share > $0.75, cancelar limit sell e deixar TP capturar big win ──
+        # ── 0b. HÍBRIDO: se share > $0.75, cancelar limit sell → TP captura big win ──
         if getattr(pos, '_limit_sell_active', False) and yes_price > 0:
             our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
             if our_price >= 0.75:
-                # Mercado indo muito bem — cancelar limit conservador, mirar alto
                 if getattr(pos, '_limit_sell_id', None):
                     await self.order_client.cancel_order(pos._limit_sell_id)
                 pos._limit_sell_active = False
@@ -684,15 +681,9 @@ class TradingEngine:
 
         # (recovery sell antigo removido — substituído por trailing stop)
 
-        # ── 1. EARLY EXIT (safety sell / delta guard / TP / EV) ──
-        # Só avalia exits de LUCRO. Stop loss foi substituído por recovery sell.
+        # ── 1. EXITS DE LUCRO APENAS — perdendo = hold to resolution ──
         current_delta = abs(self._calculate_delta(yes_price)) if yes_price > 0 else 0
         if yes_price > 0:
-            # Trackear menor preço visto (para recovery check no stop loss)
-            our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
-            if not hasattr(pos, '_lowest_price') or our_price < pos._lowest_price:
-                pos._lowest_price = our_price
-
             exit_eval = evaluate_early_exit(
                 direction=pos.direction,
                 entry_price=pos.entry_price,
@@ -701,7 +692,6 @@ class TradingEngine:
                 current_yes_price=yes_price,
                 time_remaining=time_remaining,
                 current_delta=current_delta,
-                lowest_price_seen=getattr(pos, '_lowest_price', 0.0),
             )
 
             # Log avaliação a cada 30s para debug
@@ -851,6 +841,12 @@ class TradingEngine:
                     self.share_buffer.clear()
                     return
 
+        # ── HOLD TO RESOLUTION — sem lock, sem hedge ──
+        # Dados: hedges custaram -$15 num dia, locks destruíram winners
+        # 67% accuracy × resolução binária = melhor que qualquer exit de loss
+        return
+
+        # ── CÓDIGO ABAIXO DESATIVADO (mantido pra referência) ──
         # ── 2. LOCK PROFIT — SÓ quando estamos PERDENDO ──
         # Se share está acima do entry (ganhando) → não fazer lock, deixar take profit/safety sell agir
         # Se share caiu abaixo do entry (perdendo) → lock para garantir que não perde tudo

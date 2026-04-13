@@ -128,23 +128,8 @@ def calculate_bet_size(
         1.0 - (consecutive_losses * LOSS_PENALTY_RATE)
     )
 
-    if loss_penalty < 0.6:
-        return 3  # Após 2+ losses
-
-    # Base pela trend strength
-    if trend_strength >= 2:
-        base = 6
-    else:
-        base = 4
-
-    # Streak bonus conservador: escalar sem arriscar demais
-    # Um loss de $10 apaga 7 wins de $1.40 — não compensa
-    if consecutive_wins >= 3:
-        base = min(base + 2, 8)  # Max $8 no W3+ (era $10)
-    elif consecutive_wins >= 2:
-        base = min(base + 1, 7)  # Max $7 no W2
-
-    return base
+    # $6 fixo. Sem escalada. Consistência > ambição.
+    return 6
 
 
 def sizing_breakdown(

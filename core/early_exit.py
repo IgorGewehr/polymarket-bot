@@ -1,37 +1,32 @@
 """
-Early Exit — só sai com lucro ou via recovery sell.
+Early Exit — SÓ exits de LUCRO. Sem stop loss. Sem panic sell.
 
-Prioridade (só quando GANHANDO):
-1. Safety Sell: share >= $0.85 → vender
+Dados de 284 ciclos + 43 trades live mostram:
+- Hold to resolution = +$47.34 vs exits = -$5.06
+- 67% accuracy direcional do bot = edge enorme na resolução
+- Stop loss DESTRÓI valor: -$17.84 vs -$2.55 sem SL
+- Hedges custaram -$15 num dia (eliminados)
+
+Prioridade:
+1. Safety Sell: share >= $0.85 → vender (lucro garantido)
 2. Delta Guard: delta < 10 nos últimos 60s com lucro → vender
 3. Take Profit: ganho >= 40% → vender
 4. EV Optimal: ganho >= 25% e matematicamente melhor → vender
-
-Quando PERDENDO:
-- Recovery sell: limit order a $0.48 no book, espera fill
-- Se não preencher: segura até resolução (50/50)
-- NUNCA vende no mercado a preço ruim
+5. Perdendo? → NÃO FAZER NADA. Hold to resolution.
 """
 import structlog
 from dataclasses import dataclass
 from config.settings import (
     TAKER_FEE_PCT, TAKE_PROFIT_MIN_GAIN_PCT,
-    STOP_LOSS_THRESHOLD_PCT, REVERSAL_RISK_DIVISOR,
+    REVERSAL_RISK_DIVISOR,
 )
 
 log = structlog.get_logger()
 
-# Safety sell: share muito alta → vender (lucro grande, pouco upside restante)
-SAFETY_SELL_PRICE = 0.85       # Share >= $0.85 → max $0.15 upside vs risco de reversão
-SAFETY_SELL_TIME = 200         # Ativar depois dos primeiros 100s de monitoramento
-
-# Delta guard: mercado indeciso perto do fim → vender se tem lucro
-DELTA_GUARD_THRESHOLD = 10     # Delta < 10 = indeciso
-DELTA_GUARD_TIME = 60          # Nos últimos 60s
-
-# Stop loss time gate
-SL_TIME_GATE = 150             # 2:30 restantes — antes disso, não panic sell
-SL_RECOVERY_THRESHOLD = 0.10   # Se preço recuperou 10%+ do fundo, segurar mais
+SAFETY_SELL_PRICE = 0.85
+SAFETY_SELL_TIME = 200
+DELTA_GUARD_THRESHOLD = 10
+DELTA_GUARD_TIME = 60
 
 
 @dataclass
@@ -55,14 +50,7 @@ def evaluate_early_exit(
     current_delta: float = 0.0,
     lowest_price_seen: float = 0.0,
 ) -> ExitEvaluation:
-    """
-    Avalia se vale vender shares agora.
-
-    Args:
-        current_delta: delta absoluto atual do ciclo (para delta guard)
-        lowest_price_seen: menor preço da nossa share desde entry (para recovery check)
-    """
-    # Preço bid das NOSSAS shares
+    """Avalia se vale vender. SÓ vende com lucro. Nunca com loss."""
     if direction == "Up":
         bid_price = current_yes_price
         p_win = current_yes_price
@@ -70,12 +58,10 @@ def evaluate_early_exit(
         bid_price = 1.0 - current_yes_price
         p_win = 1.0 - current_yes_price
 
-    # PnL de vender agora
     sell_proceeds = shares * bid_price * (1 - TAKER_FEE_PCT)
     sell_pnl = sell_proceeds - cost_basis
     gain_pct = (bid_price - entry_price) / entry_price if entry_price > 0 else 0
 
-    # EV de segurar (com desconto de reversão)
     win_pnl = shares * 1.0 - cost_basis
     loss_pnl = -cost_basis
     reversal_discount = max(0.05, min(0.20, time_remaining / REVERSAL_RISK_DIVISOR))
@@ -84,50 +70,30 @@ def evaluate_early_exit(
 
     no_exit = ExitEvaluation(False, "", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # Mínimo ~4.5 shares para vender (fills parciais podem dar menos que 5)
     if shares < 4.5:
         return no_exit
 
-    # Não vender nos últimos 10s (muito perto da resolução, spread pode ser ruim)
     if time_remaining < 10:
         return no_exit
 
-    # Emergency sell removido — mercado volátil bate $0.18 e volta $0.50 no mesmo ciclo
-    # Recovery sell + hold to resolution protegem melhor que panic sell a $0.18
-
-    # ── 2. SAFETY SELL — share muito alta → vender ──
+    # ── 1. SAFETY SELL — share >= $0.85 ──
     if bid_price >= SAFETY_SELL_PRICE and time_remaining < SAFETY_SELL_TIME:
         return ExitEvaluation(True, "safety_sell", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 3. DELTA GUARD — mercado indeciso nos últimos 60s ──
+    # ── 2. DELTA GUARD — mercado indeciso com lucro ──
     if (time_remaining < DELTA_GUARD_TIME
             and abs(current_delta) < DELTA_GUARD_THRESHOLD
             and sell_pnl > 0):
         return ExitEvaluation(True, "delta_guard", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 4. TAKE PROFIT — ganho bom (ativa SEMPRE) ──
+    # ── 3. TAKE PROFIT ──
     if gain_pct >= TAKE_PROFIT_MIN_GAIN_PCT and sell_pnl > hold_ev:
         return ExitEvaluation(True, "take_profit", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 5. EV PURO — vender é significativamente melhor ──
+    # ── 4. EV OPTIMAL ──
     if gain_pct >= 0.25 and sell_pnl > 0 and sell_pnl > hold_ev * 1.30:
         return ExitEvaluation(True, "ev_optimal", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 6. TRAILING STOP NA RECOVERY ──
-    # Quando perdendo: esperar preço voltar a $0.48+.
-    # Quando chegar em $0.48, ativar trailing stop com floor $0.48.
-    # Trailing: vende quando cair 12% do pico da recovery.
-    # Se nunca chegar em $0.48 → segura até resolução.
-    #
-    # Lógica é sinalizada aqui e executada no engine via _recovery_trailing.
-
-    price_drop = (entry_price - bid_price) / entry_price if entry_price > 0 else 0
-    if price_drop >= STOP_LOSS_THRESHOLD_PCT:
-        # Sinalizar pro engine que estamos em zona de recovery
-        # Engine decide se ativa trailing ou espera
-        return ExitEvaluation(
-            True, "recovery_zone", bid_price,
-            sell_proceeds, sell_pnl, hold_ev, gain_pct
-        )
-
+    # ── PERDENDO? NÃO VENDER. Hold to resolution. ──
+    # Dados: 67% accuracy, hold = +$47/dia vs exits = -$5/dia
     return no_exit
