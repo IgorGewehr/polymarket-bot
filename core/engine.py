@@ -331,7 +331,7 @@ class TradingEngine:
                 return
             else:
                 # Deadline: seguir o mercado
-                if 0.48 <= market_price <= 0.65:
+                if 0.48 <= market_price <= 0.60:
                     direction = market_trend
                     entry_price = market_price
                     log.info("entry_deadline_neutral",
@@ -342,7 +342,7 @@ class TradingEngine:
                     return
 
         # BTC trend e mercado CONCORDAM + preço na faixa → ENTRAR
-        elif btc_trend == market_trend and 0.48 <= market_price <= 0.65:
+        elif btc_trend == market_trend and 0.48 <= market_price <= 0.60:
             direction = market_trend
             entry_price = market_price
             log.info("entry_aligned",
@@ -363,7 +363,7 @@ class TradingEngine:
                 return
             else:
                 # Deadline: seguir mercado
-                if 0.48 <= market_price <= 0.65:
+                if 0.48 <= market_price <= 0.60:
                     direction = market_trend
                     entry_price = market_price
                     log.info("entry_deadline",
@@ -375,7 +375,7 @@ class TradingEngine:
                     return
 
         # Preço fora da faixa
-        elif not (0.48 <= market_price <= 0.65):
+        elif not (0.48 <= market_price <= 0.60):
             log.info("skip_price_range",
                      price=f"${market_price:.2f}")
             return
@@ -536,10 +536,10 @@ class TradingEngine:
             return
 
         # Só entrar se a share SAIU do range indeciso
-        if 0.55 < yes_price <= 0.65:
+        if 0.55 < yes_price <= 0.60:
             direction = "Up"
             entry_price = yes_price
-        elif 0.55 < no_price <= 0.65:
+        elif 0.55 < no_price <= 0.60:
             direction = "Down"
             entry_price = no_price
         else:
@@ -588,6 +588,30 @@ class TradingEngine:
                 market_id=market.get("conditionId", market.get("condition_id", "")),
                 token_id=token_id,
             )
+
+            # ── LIMIT SELL IMEDIATO (mesmo no late entry) ──
+            target_price = round(entry_price + 0.13, 2)
+            target_price = min(target_price, 0.99)
+            sell_qty = round(shares * 0.95, 2)
+            limit_order = await self.order_client.place_order(
+                token_id=token_id,
+                side="SELL",
+                price=target_price,
+                size=sell_qty,
+                fee_rate_bps=1000,
+            )
+            if limit_order:
+                oid = None
+                if isinstance(limit_order, dict):
+                    oid = limit_order.get("orderID") or limit_order.get("id")
+                self.current_position._limit_sell_id = oid
+                self.current_position._limit_sell_price = target_price
+                self.current_position._limit_sell_qty = sell_qty
+                self.current_position._limit_sell_active = True
+                log.info("limit_sell_posted",
+                         target=f"${target_price:.2f}",
+                         entry=f"${entry_price:.2f}")
+
             self.cycle_collector.record_trade(direction, actual_cost, entry_price)
             log.info("late_trade_executed",
                      direction=direction,
