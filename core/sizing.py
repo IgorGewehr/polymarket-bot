@@ -137,11 +137,12 @@ def calculate_bet_size(
     else:
         base = 4
 
-    # Streak bonus: capitalizar quando ganhando
+    # Streak bonus conservador: escalar sem arriscar demais
+    # Um loss de $10 apaga 7 wins de $1.40 — não compensa
     if consecutive_wins >= 3:
-        base = 10
+        base = min(base + 2, 8)  # Max $8 no W3+ (era $10)
     elif consecutive_wins >= 2:
-        base = 8
+        base = min(base + 1, 7)  # Max $7 no W2
 
     return base
 

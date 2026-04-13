@@ -739,12 +739,29 @@ class TradingEngine:
                             # Trailing ativo mas preço ainda subindo — segurar
                             return
                     else:
-                        # Preço ainda abaixo de $0.48 — esperar recovery
-                        if int(time_remaining) % 30 < 3:
-                            log.info("waiting_recovery",
+                        # Preço ainda abaixo de $0.48
+                        # Se faltam < 90s e nunca recuperou → cortar loss no market
+                        # Perder $3-4 agora é melhor que perder $6 na resolução
+                        if time_remaining < 90:
+                            log.info("forced_exit_no_recovery",
                                      price=f"${our_price:.2f}",
-                                     remaining=f"{time_remaining:.0f}s")
-                        return
+                                     remaining=f"{time_remaining:.0f}s",
+                                     msg="Sem recovery, cortando loss antes da resolução")
+                            exit_eval = ExitEvaluation(
+                                True, "forced_exit",
+                                our_price,
+                                pos.shares * our_price * (1 - 0.0315),
+                                pos.shares * our_price * (1 - 0.0315) - pos.bet_size,
+                                0, (our_price - pos.entry_price) / pos.entry_price
+                            )
+                            # Cair pro SELL normal abaixo
+                        else:
+                            # Ainda tem tempo — esperar recovery
+                            if int(time_remaining) % 30 < 3:
+                                log.info("waiting_recovery",
+                                         price=f"${our_price:.2f}",
+                                         remaining=f"{time_remaining:.0f}s")
+                            return
 
                 # ── SELL normal (TP, EV optimal, safety sell, delta guard) ──
                 # Cancelar limit sells pendentes antes de vender no market
