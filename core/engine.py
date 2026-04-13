@@ -717,8 +717,9 @@ class TradingEngine:
                         # Atualizar high
                         pos._recovery_high = max(pos._recovery_high, our_price)
 
-                        # Vender se caiu 12% do pico da recovery (floor $0.48)
-                        trail_trigger = pos._recovery_high * 0.88
+                        # Vender se caiu 8% do pico da recovery (floor $0.48)
+                        # Dados: trailing 8% captura 62/81 losing trades, avg -$1.21
+                        trail_trigger = pos._recovery_high * 0.92
                         trail_trigger = max(trail_trigger, 0.48)  # floor
 
                         if our_price <= trail_trigger and pos._recovery_high > 0.50:
@@ -740,9 +741,9 @@ class TradingEngine:
                             return
                     else:
                         # Preço ainda abaixo de $0.48
-                        # Se faltam < 90s e nunca recuperou → cortar loss no market
-                        # Perder $3-4 agora é melhor que perder $6 na resolução
-                        if time_remaining < 90:
+                        # Dados de 81 trades: forced exit a 3:00 → avg loss -$1.13 (vs -$2.52 na resolução)
+                        # Quanto mais cedo corta, menos perde
+                        if time_remaining < 180:
                             log.info("forced_exit_no_recovery",
                                      price=f"${our_price:.2f}",
                                      remaining=f"{time_remaining:.0f}s",
