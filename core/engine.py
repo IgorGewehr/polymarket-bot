@@ -331,7 +331,7 @@ class TradingEngine:
                 return
             else:
                 # Deadline: seguir o mercado
-                if 0.48 <= market_price <= 0.60:
+                if 0.48 <= market_price <= 0.56:
                     direction = market_trend
                     entry_price = market_price
                     log.info("entry_deadline_neutral",
@@ -342,7 +342,7 @@ class TradingEngine:
                     return
 
         # BTC trend e mercado CONCORDAM + preço na faixa → ENTRAR
-        elif btc_trend == market_trend and 0.48 <= market_price <= 0.60:
+        elif btc_trend == market_trend and 0.48 <= market_price <= 0.56:
             direction = market_trend
             entry_price = market_price
             log.info("entry_aligned",
@@ -363,7 +363,7 @@ class TradingEngine:
                 return
             else:
                 # Deadline: seguir mercado
-                if 0.48 <= market_price <= 0.60:
+                if 0.48 <= market_price <= 0.56:
                     direction = market_trend
                     entry_price = market_price
                     log.info("entry_deadline",
@@ -375,7 +375,7 @@ class TradingEngine:
                     return
 
         # Preço fora da faixa
-        elif not (0.48 <= market_price <= 0.60):
+        elif not (0.48 <= market_price <= 0.56):
             log.info("skip_price_range",
                      price=f"${market_price:.2f}")
             return
@@ -415,10 +415,7 @@ class TradingEngine:
             trend_strength=trend_strength,
         )
 
-        # Delta caindo de alto → reduzir sizing pela metade
-        if delta_falling and bet_size > 3:
-            bet_size = max(3, bet_size // 2)
-            log.info("sizing_reduced_delta", new_size=f"${bet_size}")
+        # (sizing fixo via kelly-lite — sem delta_falling)
 
         # ── EXECUTAR TRADE ──
         token_id = self._get_yes_token(market) if direction == "Up" \
@@ -447,50 +444,9 @@ class TradingEngine:
                 entry_confidence=analysis.confidence,
                 entry_alignment=int(analysis.layer2_alignment)
             )
-
-            # ── 2 LIMIT SELLS NO BOOK: profit + stop loss ──
-            sell_qty = round(shares * 0.95, 2)
-
-            # 1. PROFIT SELL a entry + $0.20
-            target_price = round(entry_price + 0.20, 2)
-            target_price = min(target_price, 0.99)
-            profit_order = await self.order_client.place_order(
-                token_id=token_id,
-                side="SELL",
-                price=target_price,
-                size=sell_qty,
-                fee_rate_bps=1000,
-            )
-            if profit_order:
-                oid = None
-                if isinstance(profit_order, dict):
-                    oid = profit_order.get("orderID") or profit_order.get("id")
-                self.current_position._limit_sell_id = oid
-                self.current_position._limit_sell_price = target_price
-                self.current_position._limit_sell_qty = sell_qty
-                self.current_position._limit_sell_active = True
-                log.info("profit_sell_posted",
-                         target=f"${target_price:.2f}",
-                         entry=f"${entry_price:.2f}",
-                         profit_per_share=f"$0.20")
-
-            # 2. STOP LOSS SELL a $0.40 (caps loss a ~$1.73)
-            sl_order = await self.order_client.place_order(
-                token_id=token_id,
-                side="SELL",
-                price=0.40,
-                size=sell_qty,
-                fee_rate_bps=1000,
-            )
-            if sl_order:
-                oid = None
-                if isinstance(sl_order, dict):
-                    oid = sl_order.get("orderID") or sl_order.get("id")
-                self.current_position._sl_sell_id = oid
-                self.current_position._sl_sell_active = True
-                log.info("stop_loss_sell_posted",
-                         price="$0.40",
-                         max_loss=f"${6.00 - sell_qty * 0.40 * 0.97:.2f}")
+            # Salvar volume no momento da entrada para ev_optimal dinâmico
+            self.current_position.entry_volume_imbalance = \
+                getattr(analysis, 'volume_imbalance', 0.0) if analysis else 0.0
 
             self.cycle_collector.record_trade(
                 direction=direction,
@@ -607,38 +563,8 @@ class TradingEngine:
                 token_id=token_id,
             )
 
-            # ── 2 LIMIT SELLS NO BOOK (late entry) ──
-            sell_qty = round(shares * 0.95, 2)
-
-            target_price = round(entry_price + 0.20, 2)
-            target_price = min(target_price, 0.99)
-            profit_order = await self.order_client.place_order(
-                token_id=token_id, side="SELL", price=target_price,
-                size=sell_qty, fee_rate_bps=1000,
-            )
-            if profit_order:
-                oid = None
-                if isinstance(profit_order, dict):
-                    oid = profit_order.get("orderID") or profit_order.get("id")
-                self.current_position._limit_sell_id = oid
-                self.current_position._limit_sell_price = target_price
-                self.current_position._limit_sell_qty = sell_qty
-                self.current_position._limit_sell_active = True
-                log.info("profit_sell_posted",
-                         target=f"${target_price:.2f}",
-                         entry=f"${entry_price:.2f}")
-
-            sl_order = await self.order_client.place_order(
-                token_id=token_id, side="SELL", price=0.40,
-                size=sell_qty, fee_rate_bps=1000,
-            )
-            if sl_order:
-                oid = None
-                if isinstance(sl_order, dict):
-                    oid = sl_order.get("orderID") or sl_order.get("id")
-                self.current_position._sl_sell_id = oid
-                self.current_position._sl_sell_active = True
-                log.info("stop_loss_sell_posted", price="$0.40")
+            # Sem GTC no book — ev_optimal gerencia exits via código
+            # (GTC orders viram zumbis se não canceladas na resolução)
 
             self.cycle_collector.record_trade(direction, actual_cost, entry_price)
             log.info("late_trade_executed",
@@ -699,34 +625,12 @@ class TradingEngine:
                 self.share_buffer.clear()
                 return
 
-        # ── 0b. CHECK STOP LOSS SELL FILL ($0.40) ──
-        if getattr(pos, '_sl_sell_active', False) and getattr(pos, '_sl_sell_id', None):
-            filled = await self.order_client._wait_for_fill(pos._sl_sell_id, timeout=0.5)
-            if filled:
-                sell_qty = pos._limit_sell_qty
-                pnl = sell_qty * 0.40 * (1 - 0.0315) - pos.bet_size
-                pos.exited_early = True
-                pos.exit_price = 0.40
-                pos.exit_reason = "stop_loss_filled"
-                pos._sl_sell_active = False
-                self.risk_manager.update(pnl)
-                # Cancelar profit sell
-                if getattr(pos, '_limit_sell_active', False) and getattr(pos, '_limit_sell_id', None):
-                    await self.order_client.cancel_order(pos._limit_sell_id)
-                    pos._limit_sell_active = False
-                log.info("stop_loss_filled",
-                         pnl=f"${pnl:+.2f}",
-                         entry=f"${pos.entry_price:.2f}",
-                         msg="Stop loss a $0.40 preencheu no book!")
-                self._cycle_exited = pos.market_id
-                self.cycle_collector.end_cycle(yes_price, pnl)
-                self.current_position = None
-                self.share_buffer.clear()
-                return
-
-        # ── 1. EXITS DE LUCRO APENAS — perdendo = hold to resolution ──
+        # ── 1. EXITS DE LUCRO — perdendo = hold to resolution (sem SL) ──
         current_delta = abs(self._calculate_delta(yes_price)) if yes_price > 0 else 0
         if yes_price > 0:
+            # Volume imbalance: usa o da última análise de entrada (salvo na posição)
+            vol_imb = getattr(pos, 'entry_volume_imbalance', 0.0)
+
             exit_eval = evaluate_early_exit(
                 direction=pos.direction,
                 entry_price=pos.entry_price,
@@ -735,6 +639,7 @@ class TradingEngine:
                 current_yes_price=yes_price,
                 time_remaining=time_remaining,
                 current_delta=current_delta,
+                volume_imbalance=vol_imb,
             )
 
             # Log avaliação a cada 30s para debug
@@ -951,6 +856,21 @@ class TradingEngine:
             self.cycle_tracker.end_cycle()
             self.share_buffer.clear()
             return
+
+        # Cancelar TODAS ordens abertas antes de resolver — evita zumbis
+        cancel_ids = []
+        if getattr(pos, '_limit_sell_active', False) and getattr(pos, '_limit_sell_id', None):
+            cancel_ids.append(pos._limit_sell_id)
+            pos._limit_sell_active = False
+        if getattr(pos, '_sl_sell_active', False) and getattr(pos, '_sl_sell_id', None):
+            cancel_ids.append(pos._sl_sell_id)
+            pos._sl_sell_active = False
+        if cancel_ids:
+            await asyncio.gather(
+                *[self.order_client.cancel_order(oid) for oid in cancel_ids],
+                return_exceptions=True
+            )
+            log.info("resolve_cancelled_open_orders", count=len(cancel_ids))
 
         # Determinar resultado
         final_price = self.poly_feed.yes_price
