@@ -182,6 +182,17 @@ def get_adaptive_threshold(btc_buffer: PriceBuffer) -> tuple[float, str]:
         return BTC_SL_NORMAL_THRESHOLD_PCT, "normal"
 
 
+def is_sideways_market(btc_buffer: PriceBuffer) -> bool:
+    """
+    Verifica se o regime do mercado esta lateral (choppy/sideways).
+    Útil para filtrar entradas: não operar durante fortes tendências.
+    """
+    atr = calculate_5m_atr(btc_buffer)
+    if atr >= BTC_ATR_VOLATILE_LOWER:
+        return False
+    return True
+
+
 def calculate_btc_slopes(btc_buffer: PriceBuffer) -> dict[str, float]:
     """
     Calculate BTC price slopes over 1m, 2m, 3m windows.

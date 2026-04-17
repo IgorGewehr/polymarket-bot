@@ -1,37 +1,119 @@
 """
-Engine principal do bot.
-Orquestra o ciclo completo: coleta → análise → entrada → monitoramento → resolução.
+Market Maker Engine — Buy cheap sides, lock profit, or take profit.
+
+Strategy modeled after top whale traders (3500+ trades analyzed):
+  Frequent-Jack: +$206  |  0x20d2309cd9: +$245
+
+Core idea:
+  1. Buy one side when cheap (<= $0.48) guided by signals
+  2. If the OTHER side also becomes cheap (<= $0.45), buy it too
+     -> total cost < $1.00 = guaranteed profit at resolution
+  3. Sell positions when price rises (take profit)
+  4. NEVER sell at a loss — hold to resolution instead
+
+Phases (by time remaining in 5-min cycle):
+  COLLECT    5:00 -> 4:00  Accumulate data, track prices
+  FIRST_BUY  4:00 -> 3:00  Buy one side if cheap + signals agree
+  MANAGE     3:00 -> 1:30  Lock profit (buy other side) or take profit (sell)
+  EXIT       1:30 -> 0:00  Late sell if profitable, else hold to resolution
 """
 import asyncio
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 import structlog
 
 from config.settings import (
-    TICK_INTERVAL, ENTRY_WINDOW_START, ENTRY_WINDOW_SOFT,
-    ENTRY_DEADLINE, ENTRY_CUTOFF, MIN_TIME_REMAINING,
-    MIN_DELTA, MIN_RETURN_PCT, MIN_CONFIDENCE,
-    BUFFER_SIZE, BTC_BUFFER_SIZE, DRY_RUN
-)
-from core.analyzer import run_analysis, AnalysisResult, calc_momentum
-from core.sizing import calculate_bet_size, get_time_slot
-from core.hedger import (
-    Position, HedgeOpportunity, HedgeTracker,
-    should_evaluate_hedge, should_execute_hedge,
-    estimate_loss_probability
+    TICK_INTERVAL, DRY_RUN,
+    PHASE_COLLECT_START, PHASE_FIRST_BUY_START, PHASE_FIRST_BUY_END,
+    PHASE_SECOND_BUY_START, PHASE_SECOND_BUY_END, PHASE_EXIT_START,
+    SHARES_PER_TRADE, MIN_BUY_PRICE, MAX_BUY_PRICE, LOCK_BUY_PRICE,
+    TAKE_PROFIT_PCT, LATE_SELL_PCT,
+    MAKER_FILL_TIMEOUT,
+    BUFFER_SIZE, BTC_BUFFER_SIZE,
 )
 from core.risk_manager import RiskManager
+from core.analyzer import calc_slope
 from data.price_buffer import PriceBuffer, CycleTracker
 from data.feeds import BinanceFeed, PolymarketFeed, PolymarketREST
+from data.signals import (
+    ChainlinkFeed, VolumeImbalanceFeed, LiquidationFeed, SignalAggregator,
+)
 from data.storage import Storage
 from data.cycle_collector import CycleCollector
-from core.lock_profit import evaluate_lock
-from core.early_exit import evaluate_early_exit, ExitEvaluation
-from execution.order_client import OrderClient, execute_trade, execute_hedge, execute_sell, execute_lock
+from execution.order_client import OrderClient, execute_trade, execute_sell, execute_sell_taker, post_lock_limit
 from monitoring.notifier import TelegramNotifier
+from core.btc_stop_loss import is_sideways_market
 
 log = structlog.get_logger()
 
+
+# ---------------------------------------------------------------------------
+# Position dataclass — tracks YES and NO sides independently
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MarketMakerPosition:
+    """Tracks both sides of a binary market within a single cycle."""
+
+    # YES side
+    yes_shares: float = 0.0
+    yes_entry: float = 0.0
+    yes_cost: float = 0.0
+    yes_token_id: str = ""
+    yes_order_id: str = ""
+
+    # NO side
+    no_shares: float = 0.0
+    no_entry: float = 0.0
+    no_cost: float = 0.0
+    no_token_id: str = ""
+    no_order_id: str = ""
+
+    # Flags
+    yes_sold: bool = False
+    no_sold: bool = False
+    yes_sell_price: float = 0.0
+    no_sell_price: float = 0.0
+    yes_sl_attempts: int = 0
+    no_sl_attempts: int = 0
+    pending_lock_order_id: str = ""
+    pending_lock_posted_at: float = 0.0
+
+    @property
+    def is_locked(self) -> bool:
+        """True if we hold both YES and NO (guaranteed profit)."""
+        return self.yes_shares > 0 and self.no_shares > 0
+
+    @property
+    def locked_profit(self) -> float:
+        """Guaranteed profit if holding both sides and resolution occurs."""
+        if not self.is_locked:
+            return 0.0
+        # At resolution, min(yes, no) shares pay out $1 each
+        matched = min(self.yes_shares, self.no_shares)
+        return matched * 1.0 - self.yes_cost - self.no_cost
+
+    @property
+    def total_cost(self) -> float:
+        return self.yes_cost + self.no_cost
+
+    @property
+    def has_yes(self) -> bool:
+        return self.yes_shares > 0 and not self.yes_sold
+
+    @property
+    def has_no(self) -> bool:
+        return self.no_shares > 0 and not self.no_sold
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.has_yes and not self.has_no
+
+
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
 
 class TradingEngine:
     def __init__(self):
@@ -39,152 +121,906 @@ class TradingEngine:
         self.share_buffer = PriceBuffer(BUFFER_SIZE)
         self.btc_buffer = PriceBuffer(BTC_BUFFER_SIZE)
         self.cycle_tracker = CycleTracker(max_cycles=10)
-        # Seed com deltas razoáveis para evitar regime "lateral" no startup
         for _ in range(3):
             self.cycle_tracker.current_cycle_max_delta = 20
             self.cycle_tracker.end_cycle()
 
-        # Core
+        # Risk
         self.risk_manager = RiskManager()
-        self.hedge_tracker = HedgeTracker()
 
-        # Data
+        # Data feeds
         self.btc_feed = BinanceFeed(self.btc_buffer)
         self.poly_feed = PolymarketFeed(self.share_buffer)
         self.poly_rest = PolymarketREST()
+
+        # Signal feeds
+        self.chainlink_feed = ChainlinkFeed()
+        self.volume_feed = VolumeImbalanceFeed()
+        self.liquidation_feed = LiquidationFeed()
+        self.signal_agg = SignalAggregator(
+            self.chainlink_feed, self.volume_feed, self.liquidation_feed,
+        )
+
+        # Persistence
         self.storage = Storage()
-
-        # Execution
         self.order_client = OrderClient()
-
-        # Monitoring
         self.notifier = TelegramNotifier()
-
-        # Data collection (Excel)
         self.cycle_collector = CycleCollector()
 
         # State
-        self.current_position: Position | None = None
+        self.position: MarketMakerPosition | None = None
         self.current_market: dict | None = None
         self.running = False
-        self._cycle_exited: str = ""  # Market ID do ciclo onde já saímos — bloqueia re-entry
+        self._bought_yes_this_cycle: bool = False
+        self._bought_no_this_cycle: bool = False
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self):
-        """Inicializa conexões e inicia o loop principal."""
-        log.info("engine_starting", dry_run=DRY_RUN)
+        log.info("engine_starting",
+                 dry_run=DRY_RUN,
+                 strategy="market_maker",
+                 shares=SHARES_PER_TRADE,
+                 max_buy=f"${MAX_BUY_PRICE}",
+                 lock_mode="dynamic (entry+other ≤ $0.90)",
+                 tp=f"{TAKE_PROFIT_PCT:.0%}",
+                 late_sell=f"{LATE_SELL_PCT:.0%}")
         self.storage.connect()
-
-        # Inicializar cliente de ordens (CLOB auth)
         await self.order_client.initialize()
 
-        # Iniciar feed de BTC em background
-        btc_task = asyncio.create_task(self.btc_feed.connect())
+        # Launch background feed connections
+        asyncio.create_task(self.btc_feed.connect())
+        asyncio.create_task(self.chainlink_feed.connect())
+        asyncio.create_task(self.volume_feed.connect())
+        asyncio.create_task(self.liquidation_feed.connect())
 
         self.running = True
         try:
-            await self.main_loop()
+            await self._main_loop()
         except KeyboardInterrupt:
-            log.info("engine_stopping")
+            log.info("engine_stopping_keyboard")
         finally:
             self.running = False
             await self.shutdown()
 
     async def shutdown(self):
-        """Fecha todas as conexões."""
         await self.btc_feed.disconnect()
         await self.poly_feed.disconnect()
         await self.poly_rest.close()
+        await self.chainlink_feed.disconnect()
+        await self.volume_feed.disconnect()
+        await self.liquidation_feed.disconnect()
         await self.order_client.close()
         await self.notifier.close()
         self.storage.close()
         log.info("engine_stopped")
 
-    async def main_loop(self):
-        """
-        Loop principal — roda indefinidamente.
-        A cada iteração (2s), determina em que fase está e age.
-        """
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    async def _main_loop(self):
         log.info("main_loop_started")
         last_daily_reset = ""
 
         while self.running:
             try:
-                now = time.time()
+                # Daily reset
                 today = datetime.now().strftime("%Y-%m-%d")
-
-                # Reset diário
                 if today != last_daily_reset:
                     self.risk_manager.reset_daily()
-                    self.hedge_tracker.reset_daily()
                     last_daily_reset = today
-                    log.info("daily_reset", date=today)
 
-                # Se tem posição aberta e o mercado dela expirou → resolver PRIMEIRO
-                if self.current_position and self.current_market:
-                    old_remaining = self._get_time_remaining(self.current_market)
-                    if old_remaining <= 0:
-                        await self._phase_resolve(self.current_market)
+                # Resolve expired position
+                if self.position and self.current_market:
+                    remaining = self._get_time_remaining(self.current_market)
+                    if remaining <= 0:
+                        await self._phase_resolve()
 
-                # Encontrar mercado ativo
+                # Find active market
                 market = await self._find_active_market()
                 if not market:
                     await asyncio.sleep(5)
                     continue
 
-                time_remaining = self._get_time_remaining(market)
+                remaining = self._get_time_remaining(market)
 
-                # ── Fase 1: Coleta (5:00 → 4:30) ──
-                if time_remaining > ENTRY_WINDOW_START:
-                    await self._phase_collect(market)
+                # Route to correct phase
+                if remaining > PHASE_FIRST_BUY_START:
+                    await self._phase_collect(market, remaining)
 
-                # ── Fase 2: Análise + Entrada (4:30 → 3:30) ──
-                elif time_remaining > ENTRY_CUTOFF and not self.current_position:
-                    await self._phase_analyze_and_enter(market, time_remaining)
+                elif remaining > PHASE_FIRST_BUY_END:
+                    await self._phase_collect(market, remaining)
+                    # Se já tem posição, checar lock mesmo durante first_buy
+                    if self.position and not self.position.is_empty and not self.position.is_locked:
+                        await self._phase_manage(market, remaining)
+                    else:
+                        await self._phase_first_buy(market, remaining)
 
-                # ── Fase 2b: Entry tardio (3:30 → 2:00) para mercado indeciso ──
-                elif time_remaining > 120 and not self.current_position:
-                    await self._phase_late_entry(market, time_remaining)
+                elif remaining > PHASE_EXIT_START:
+                    await self._phase_collect(market, remaining)
+                    await self._phase_manage(market, remaining)
 
-                # ── Fase 3: Monitoramento + Hedge (até 0:00) ──
-                elif self.current_position and time_remaining > 0:
-                    await self._phase_monitor(market, time_remaining)
+                elif remaining > 0:
+                    await self._phase_collect(market, remaining)
+                    await self._phase_exit(market, remaining)
 
-                # ── Fase 4: Resolução ──
-                elif time_remaining <= 0 and self.current_position:
-                    await self._phase_resolve(market)
-
-                # ── Ciclo acabou sem posição ──
-                elif time_remaining <= 0:
-                    # Salvar dados do ciclo no Excel (mesmo sem trade)
-                    final_price = self.poly_feed.yes_price
-                    if final_price > 0:
-                        self.cycle_collector.end_cycle(
-                            final_yes_price=final_price,
-                            pnl=0.0,
-                        )
-                    self.cycle_tracker.end_cycle()
-                    self.share_buffer.clear()
-                    await asyncio.sleep(3)
-                    continue
+                elif remaining <= 0:
+                    if self.position and not self.position.is_empty:
+                        await self._phase_resolve()
+                    else:
+                        # No position — just clean up the cycle
+                        final_price = self.poly_feed.yes_price
+                        if final_price > 0:
+                            self.cycle_collector.end_cycle(final_price, 0.0)
+                        self.cycle_tracker.end_cycle()
+                        self.share_buffer.clear()
+                        self._reset_cycle_flags()
+                        await asyncio.sleep(3)
+                        continue
 
                 await asyncio.sleep(TICK_INTERVAL)
 
             except Exception as e:
-                log.error("main_loop_error", error=str(e))
+                log.error("main_loop_error", error=str(e), exc_info=True)
                 await asyncio.sleep(5)
 
+    # ------------------------------------------------------------------
+    # Phase 1: COLLECT (5:00 -> 4:00)
+    # ------------------------------------------------------------------
+
+    async def _phase_collect(self, market: dict, remaining: float):
+        """Accumulate price data and snapshots."""
+        yes_price = self.poly_feed.yes_price
+        if yes_price <= 0:
+            return
+
+        delta = self._calculate_delta(yes_price)
+        self.share_buffer.append(time.time(), yes_price, delta)
+        self.cycle_tracker.update_tick(delta)
+        self.cycle_collector.capture_snapshot(
+            time_remaining=remaining,
+            delta=delta,
+            yes_price=yes_price,
+            btc_price=self.btc_feed.last_price,
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 2: FIRST BUY (4:00 -> 3:00)
+    # ------------------------------------------------------------------
+
+    async def _phase_first_buy(self, market: dict, remaining: float):
+        """Buy one side if cheap and signals agree on direction."""
+        # Already bought both sides or risk limit hit
+        if self._bought_yes_this_cycle and self._bought_no_this_cycle:
+            return
+        can_trade, reason = self.risk_manager.can_trade()
+        if not can_trade:
+            return
+
+        # Filtro de Regime: Pula entrada se o mercado estiver direcional/volatil
+        if not is_sideways_market(self.btc_buffer):
+            log.info("skipping_first_buy_regime", reason="Market is trending or highly volatile.")
+            return
+
+        yes_price = self.poly_feed.yes_price
+        no_price = self.poly_feed.no_price
+        if yes_price <= 0 or no_price <= 0:
+            return
+
+        # Comprar o lado mais barato no range $0.38-$0.45
+        if yes_price <= no_price and MIN_BUY_PRICE <= yes_price <= MAX_BUY_PRICE and not self._bought_yes_this_cycle:
+            await self._buy_yes(market, yes_price, remaining, "first_buy")
+            return
+
+        if no_price < yes_price and MIN_BUY_PRICE <= no_price <= MAX_BUY_PRICE and not self._bought_no_this_cycle:
+            await self._buy_no(market, no_price, remaining, "first_buy")
+            return
+
+    # ------------------------------------------------------------------
+    # Phase 3: MANAGE (3:00 -> 1:30) — Lock profit or take profit
+    # ------------------------------------------------------------------
+
+    async def _phase_manage(self, market: dict, remaining: float):
+        """
+        Two possible actions:
+          a) LOCK PROFIT: if we hold one side and the other becomes cheap,
+             buy the other side -> guaranteed profit
+          b) TAKE PROFIT: if our side's price rose to >= TAKE_PROFIT_PRICE,
+             sell it
+        """
+        pos = self.position
+        yes_price = self.poly_feed.yes_price
+        no_price = self.poly_feed.no_price
+        if yes_price <= 0 or no_price <= 0:
+            return
+
+        # --- Check if pending lock order filled ---
+        if pos and pos.pending_lock_order_id and not pos.is_locked:
+            filled = await self.order_client._verify_fill(
+                pos.pending_lock_order_id, timeout=0.5
+            )
+            if filled:
+                # Lock order filled! Update position
+                if pos.has_yes and not pos.has_no:
+                    lock_price = 0.90 - pos.yes_entry  # approximate
+                    pos.no_shares = SHARES_PER_TRADE
+                    pos.no_entry = lock_price
+                    pos.no_cost = SHARES_PER_TRADE * lock_price
+                    pos.no_token_id = self._get_no_token(market) or ""
+                    self._bought_no_this_cycle = True
+                elif pos.has_no and not pos.has_yes:
+                    lock_price = 0.90 - pos.no_entry
+                    pos.yes_shares = SHARES_PER_TRADE
+                    pos.yes_entry = lock_price
+                    pos.yes_cost = SHARES_PER_TRADE * lock_price
+                    pos.yes_token_id = self._get_yes_token(market) or ""
+                    self._bought_yes_this_cycle = True
+                pos.pending_lock_order_id = ""
+                log.info("pending_lock_FILLED",
+                         locked=pos.is_locked,
+                         profit=f"${pos.locked_profit:+.2f}")
+
+        # --- Already locked: just wait for resolution ---
+        if pos and pos.is_locked:
+            if int(remaining) % 30 < 3:
+                log.info("locked_position_holding",
+                         profit=f"${pos.locked_profit:+.2f}",
+                         remaining=f"{remaining:.0f}s")
+            return
+
+        # --- Holding YES only ---
+        if pos and pos.has_yes and not pos.has_no:
+            # Lock opportunity: dynamic threshold based on entry
+            # Lock if total per-share cost < $0.90 → guaranteed +$0.50 profit
+            lock_max_no = 0.90 - pos.yes_entry
+            has_pending_lock = bool(pos.pending_lock_order_id)
+            if no_price <= lock_max_no and not self._bought_no_this_cycle and not has_pending_lock:
+                lock_profit = (1.0 - pos.yes_entry - no_price) * SHARES_PER_TRADE
+                log.info("lock_opportunity_detected",
+                         yes_entry=f"${pos.yes_entry:.2f}",
+                         no_price=f"${no_price:.2f}",
+                         lock_max=f"${lock_max_no:.2f}",
+                         lock_profit=f"${lock_profit:+.2f}")
+                await self._buy_no(market, no_price, remaining, "lock_profit")
+                return
+
+            # Take profit: YES rose
+            yes_tp = pos.yes_entry * (1 + TAKE_PROFIT_PCT) if pos.yes_entry > 0 else 99
+            if yes_price >= yes_tp:
+                await self._sell_yes(pos, yes_price, remaining, "take_profit")
+                return
+
+            # Time-Stop aos 40s
+            time_stop_triggered = (pos.pending_lock_posted_at > 0 and
+                                   time.time() - pos.pending_lock_posted_at > 40 and
+                                   not pos.is_locked)
+            if time_stop_triggered:
+                log.info("manage_time_stop_yes", price=f"${yes_price:.2f}", elapsed=time.time() - pos.pending_lock_posted_at)
+                await self._sell_yes(pos, yes_price, remaining, "time_stop")
+                return
+
+            # Stop loss -20% (após 1:45)
+            yes_gain = (yes_price - pos.yes_entry) / pos.yes_entry if pos.yes_entry > 0 else 0
+            if yes_gain <= -0.20 and remaining <= 105 and pos.yes_sl_attempts < 3:
+                pos.yes_sl_attempts += 1
+                log.info("manage_sl_yes", price=f"${yes_price:.2f}", gain=f"{yes_gain:+.0%}",
+                         attempt=f"{pos.yes_sl_attempts}/3")
+                await self._sell_yes(pos, yes_price, remaining, "stop_loss")
+                return
+
+        # --- Holding NO only ---
+        if pos and pos.has_no and not pos.has_yes:
+            # Lock opportunity: dynamic threshold based on entry
+            lock_max_yes = 0.90 - pos.no_entry
+            has_pending_lock = bool(pos.pending_lock_order_id)
+            if yes_price <= lock_max_yes and not self._bought_yes_this_cycle and not has_pending_lock:
+                lock_profit = (1.0 - pos.no_entry - yes_price) * SHARES_PER_TRADE
+                log.info("lock_opportunity_detected",
+                         no_entry=f"${pos.no_entry:.2f}",
+                         yes_price=f"${yes_price:.2f}",
+                         lock_max=f"${lock_max_yes:.2f}",
+                         lock_profit=f"${lock_profit:+.2f}")
+                await self._buy_yes(market, yes_price, remaining, "lock_profit")
+                return
+
+            # Take profit: NO rose
+            no_tp = pos.no_entry * (1 + TAKE_PROFIT_PCT) if pos.no_entry > 0 else 99
+            if no_price >= no_tp:
+                await self._sell_no(pos, no_price, remaining, "take_profit")
+                return
+
+            # Time-Stop aos 40s
+            time_stop_triggered = (pos.pending_lock_posted_at > 0 and
+                                   time.time() - pos.pending_lock_posted_at > 40 and
+                                   not pos.is_locked)
+            if time_stop_triggered:
+                log.info("manage_time_stop_no", price=f"${no_price:.2f}", elapsed=time.time() - pos.pending_lock_posted_at)
+                await self._sell_no(pos, no_price, remaining, "time_stop")
+                return
+
+            # Stop loss -20% (após 1:45)
+            no_gain = (no_price - pos.no_entry) / pos.no_entry if pos.no_entry > 0 else 0
+            if no_gain <= -0.20 and remaining <= 105 and pos.no_sl_attempts < 3:
+                pos.no_sl_attempts += 1
+                log.info("manage_sl_no", price=f"${no_price:.2f}", gain=f"{no_gain:+.0%}",
+                         attempt=f"{pos.no_sl_attempts}/3")
+                await self._sell_no(pos, no_price, remaining, "stop_loss")
+                return
+
+        # --- No position yet: try first buy if still in window ---
+        has_traded = self._bought_yes_this_cycle or self._bought_no_this_cycle
+        if not has_traded and remaining > PHASE_FIRST_BUY_END:
+            await self._phase_first_buy(market, remaining)
+
+    # ------------------------------------------------------------------
+    # Phase 4: EXIT (1:30 -> 0:00)
+    # ------------------------------------------------------------------
+
+    async def _phase_exit(self, market: dict, remaining: float):
+        """
+        Exit phase logic:
+          - Locked position -> hold (guaranteed profit)
+          - Single side with profit >= LATE_SELL_PRICE -> sell
+          - Single side losing -> hold to resolution (NEVER sell at a loss)
+        """
+        pos = self.position
+        yes_price = self.poly_feed.yes_price
+        no_price = self.poly_feed.no_price
+        if yes_price <= 0:
+            return
+
+        if not pos or pos.is_empty:
+            return
+
+        # Locked: just hold
+        if pos.is_locked:
+            if int(remaining) % 30 < 3:
+                log.info("exit_locked_holding",
+                         profit=f"${pos.locked_profit:+.2f}",
+                         remaining=f"{remaining:.0f}s")
+            return
+
+        # Holding YES only
+        if pos.has_yes:
+            gain_pct = (yes_price - pos.yes_entry) / pos.yes_entry if pos.yes_entry > 0 else 0
+            yes_late = pos.yes_entry * (1 + LATE_SELL_PCT) if pos.yes_entry > 0 else 99
+            # Late sell (profit)
+            if yes_price >= yes_late and yes_price > pos.yes_entry:
+                await self._sell_yes(pos, yes_price, remaining, "late_sell")
+                return
+            # Time-Stop aos 40s
+            time_stop_triggered = (pos.pending_lock_posted_at > 0 and
+                                   time.time() - pos.pending_lock_posted_at > 40 and
+                                   not pos.is_locked)
+            if time_stop_triggered:
+                log.info("exit_time_stop_yes", price=f"${yes_price:.2f}", elapsed=time.time() - pos.pending_lock_posted_at)
+                await self._sell_yes(pos, yes_price, remaining, "time_stop")
+                return
+
+            # Stop loss -20% (max 3 tentativas, depois hold to resolution)
+            if gain_pct <= -0.20 and pos.yes_sl_attempts < 3:
+                pos.yes_sl_attempts += 1
+                log.info("exit_sl_yes", price=f"${yes_price:.2f}", gain=f"{gain_pct:+.0%}",
+                         attempt=f"{pos.yes_sl_attempts}/3")
+                await self._sell_yes(pos, yes_price, remaining, "stop_loss")
+                return
+            if int(remaining) % 30 < 3:
+                log.info("exit_holding_yes",
+                         price=f"${yes_price:.2f}",
+                         entry=f"${pos.yes_entry:.2f}",
+                         gain=f"{gain_pct:+.0%}",
+                         remaining=f"{remaining:.0f}s")
+
+        # Holding NO only
+        if pos.has_no:
+            no_gain_pct = (no_price - pos.no_entry) / pos.no_entry if pos.no_entry > 0 else 0
+            no_late = pos.no_entry * (1 + LATE_SELL_PCT) if pos.no_entry > 0 else 99
+            if no_price >= no_late and no_price > pos.no_entry:
+                await self._sell_no(pos, no_price, remaining, "late_sell")
+                return
+            # Time-Stop aos 40s
+            time_stop_triggered = (pos.pending_lock_posted_at > 0 and
+                                   time.time() - pos.pending_lock_posted_at > 40 and
+                                   not pos.is_locked)
+            if time_stop_triggered:
+                log.info("exit_time_stop_no", price=f"${no_price:.2f}", elapsed=time.time() - pos.pending_lock_posted_at)
+                await self._sell_no(pos, no_price, remaining, "time_stop")
+                return
+
+            # Stop loss -20% (max 3 tentativas, depois hold to resolution)
+            if no_gain_pct <= -0.20 and pos.no_sl_attempts < 3:
+                pos.no_sl_attempts += 1
+                log.info("exit_sl_no", price=f"${no_price:.2f}", gain=f"{no_gain_pct:+.0%}",
+                         attempt=f"{pos.no_sl_attempts}/3")
+                await self._sell_no(pos, no_price, remaining, "stop_loss")
+                return
+            if int(remaining) % 30 < 3:
+                gain_pct = (no_price - pos.no_entry) / pos.no_entry if pos.no_entry > 0 else 0
+                log.info("exit_holding_no",
+                         price=f"${no_price:.2f}",
+                         entry=f"${pos.no_entry:.2f}",
+                         gain=f"{gain_pct:+.0%}",
+                         remaining=f"{remaining:.0f}s")
+
+    # ------------------------------------------------------------------
+    # Resolution
+    # ------------------------------------------------------------------
+
+    async def _phase_resolve(self):
+        """Cycle ended. Compute PnL based on final prices and position."""
+        pos = self.position
+        if not pos or pos.is_empty:
+            self._clean_up_cycle()
+            return
+
+        final_yes = self.poly_feed.yes_price
+        yes_won = final_yes > 0.5
+
+        pnl = 0.0
+        result_parts = []
+
+        # --- Locked position: guaranteed payout ---
+        if pos.is_locked:
+            matched = min(pos.yes_shares, pos.no_shares)
+            pnl = matched * 1.0 - pos.total_cost
+            result = "LOCK_WIN" if pnl > 0 else "LOCK_LOSS"
+            result_parts.append(f"locked matched={matched:.0f}")
+        else:
+            # --- YES side ---
+            if pos.has_yes:
+                if yes_won:
+                    pnl += pos.yes_shares * 1.0 - pos.yes_cost
+                    result_parts.append("YES_WIN")
+                else:
+                    pnl += -pos.yes_cost
+                    result_parts.append("YES_LOSS")
+
+            # --- NO side ---
+            if pos.has_no:
+                if not yes_won:
+                    pnl += pos.no_shares * 1.0 - pos.no_cost
+                    result_parts.append("NO_WIN")
+                else:
+                    pnl += -pos.no_cost
+                    result_parts.append("NO_LOSS")
+
+            # --- Already-sold sides: add their realized PnL ---
+            if pos.yes_sold:
+                sell_proceeds = pos.yes_shares * pos.yes_sell_price * (1 - 0.0315)
+                sell_pnl = sell_proceeds - pos.yes_cost
+                pnl += sell_pnl
+                result_parts.append(f"YES_SOLD(${sell_pnl:+.2f})")
+
+            if pos.no_sold:
+                sell_proceeds = pos.no_shares * pos.no_sell_price * (1 - 0.0315)
+                sell_pnl = sell_proceeds - pos.no_cost
+                pnl += sell_pnl
+                result_parts.append(f"NO_SOLD(${sell_pnl:+.2f})")
+
+            result = " + ".join(result_parts) if result_parts else "EMPTY"
+
+        self.risk_manager.update(pnl)
+
+        log.info("cycle_resolved",
+                 result=result,
+                 pnl=f"${pnl:+.2f}",
+                 final_yes=f"${final_yes:.2f}",
+                 yes_won=yes_won,
+                 had_yes=pos.yes_shares > 0,
+                 had_no=pos.no_shares > 0,
+                 locked=pos.is_locked,
+                 pnl_today=f"${self.risk_manager.state.pnl_today:+.2f}")
+
+        # Notify
+        await self.notifier.notify_result(
+            won=pnl > 0,
+            pnl=pnl,
+            pnl_today=self.risk_manager.state.pnl_today,
+        )
+
+        # Persist
+        try:
+            self.storage.conn.execute(
+                "UPDATE trades SET result = ?, pnl = ?, resolution_price = ? "
+                "WHERE timestamp = (SELECT MAX(timestamp) FROM trades)",
+                [result, round(pnl, 2), round(final_yes, 4)]
+            )
+        except Exception:
+            pass
+
+        self.cycle_collector.end_cycle(final_yes, pnl)
+        self._clean_up_cycle()
+
+    # ------------------------------------------------------------------
+    # Buy / Sell helpers
+    # ------------------------------------------------------------------
+
+    async def _buy_yes(self, market: dict, price: float, remaining: float, reason: str):
+        """Place a maker BUY order for YES shares."""
+        token_id = self._get_yes_token(market)
+        if not token_id:
+            log.warning("no_yes_token")
+            return
+
+        cost = SHARES_PER_TRADE * price
+        log.info("buy_yes_attempt",
+                 reason=reason,
+                 price=f"${price:.2f}",
+                 cost=f"${cost:.2f}",
+                 remaining=f"{remaining:.0f}s")
+
+        order = await execute_trade(
+            self.order_client, token_id, "Up", cost, price
+        )
+        if not order:
+            log.warning("buy_yes_failed", price=f"${price:.2f}", reason=reason)
+            return
+
+        order_id = ""
+        if isinstance(order, dict):
+            order_id = order.get("id") or order.get("orderID") or ""
+
+        # Initialize position if needed
+        if not self.position:
+            self.position = MarketMakerPosition()
+
+        self.position.yes_shares = SHARES_PER_TRADE
+        self.position.yes_entry = price
+        self.position.yes_cost = cost
+        self.position.yes_token_id = token_id
+        self.position.yes_order_id = str(order_id)
+
+        self._bought_yes_this_cycle = True
+
+        log.info("buy_yes_filled",
+                 reason=reason,
+                 price=f"${price:.2f}",
+                 cost=f"${cost:.2f}",
+                 locked=self.position.is_locked,
+                 locked_profit=f"${self.position.locked_profit:+.2f}" if self.position.is_locked else "N/A")
+
+        # Persist trade
+        market_id = market.get("conditionId", market.get("condition_id", ""))
+        self.storage.log_trade({
+            "timestamp": time.time(),
+            "market_id": market_id,
+            "direction": "Up",
+            "bet_size": cost,
+            "entry_price": price,
+            "entry_time_remaining": remaining,
+        })
+        self.cycle_collector.record_trade("Up", cost, price)
+
+        await self.notifier.send(
+            f"<b>BUY YES</b> ({reason})\n"
+            f"${price:.2f} x {SHARES_PER_TRADE} = ${cost:.2f}\n"
+            f"Locked: {'YES' if self.position.is_locked else 'NO'}"
+        )
+
+        # Postar lock limit imediato pro outro lado (GTD, expira no fim do ciclo)
+        if not self.position.is_locked and not self._bought_no_this_cycle:
+            lock_max_price = round(0.90 - price, 2)
+            no_token = self._get_no_token(market)
+            if no_token and lock_max_price > 0.15:
+                lock_order_id = await post_lock_limit(
+                    self.order_client, no_token,
+                    lock_max_price, SHARES_PER_TRADE,
+                    expiry_seconds=remaining,
+                )
+                if lock_order_id:
+                    self.position.pending_lock_order_id = lock_order_id
+                    self.position.pending_lock_posted_at = time.time()
+                    log.info("lock_limit_auto_posted",
+                             side="NO", max_price=f"${lock_max_price:.2f}",
+                             yes_entry=f"${price:.2f}")
+
+    async def _buy_no(self, market: dict, price: float, remaining: float, reason: str):
+        """Place a maker BUY order for NO shares."""
+        token_id = self._get_no_token(market)
+        if not token_id:
+            log.warning("no_no_token")
+            return
+
+        cost = SHARES_PER_TRADE * price
+        log.info("buy_no_attempt",
+                 reason=reason,
+                 price=f"${price:.2f}",
+                 cost=f"${cost:.2f}",
+                 remaining=f"{remaining:.0f}s")
+
+        order = await execute_trade(
+            self.order_client, token_id, "Down", cost, price
+        )
+        if not order:
+            log.warning("buy_no_failed", price=f"${price:.2f}", reason=reason)
+            return
+
+        order_id = ""
+        if isinstance(order, dict):
+            order_id = order.get("id") or order.get("orderID") or ""
+
+        if not self.position:
+            self.position = MarketMakerPosition()
+
+        self.position.no_shares = SHARES_PER_TRADE
+        self.position.no_entry = price
+        self.position.no_cost = cost
+        self.position.no_token_id = token_id
+        self.position.no_order_id = str(order_id)
+
+        self._bought_no_this_cycle = True
+
+        log.info("buy_no_filled",
+                 reason=reason,
+                 price=f"${price:.2f}",
+                 cost=f"${cost:.2f}",
+                 locked=self.position.is_locked,
+                 locked_profit=f"${self.position.locked_profit:+.2f}" if self.position.is_locked else "N/A")
+
+        market_id = market.get("conditionId", market.get("condition_id", ""))
+        self.storage.log_trade({
+            "timestamp": time.time(),
+            "market_id": market_id,
+            "direction": "Down",
+            "bet_size": cost,
+            "entry_price": price,
+            "entry_time_remaining": remaining,
+        })
+        self.cycle_collector.record_trade("Down", cost, price)
+
+        await self.notifier.send(
+            f"<b>BUY NO</b> ({reason})\n"
+            f"${price:.2f} x {SHARES_PER_TRADE} = ${cost:.2f}\n"
+            f"Locked: {'YES' if self.position.is_locked else 'NO'}"
+        )
+
+        # Postar lock limit imediato pro outro lado (GTD)
+        if not self.position.is_locked and not self._bought_yes_this_cycle:
+            lock_max_price = round(0.90 - price, 2)
+            yes_token = self._get_yes_token(market)
+            if yes_token and lock_max_price > 0.15:
+                lock_order_id = await post_lock_limit(
+                    self.order_client, yes_token,
+                    lock_max_price, SHARES_PER_TRADE,
+                    expiry_seconds=remaining,
+                )
+                if lock_order_id:
+                    self.position.pending_lock_order_id = lock_order_id
+                    self.position.pending_lock_posted_at = time.time()
+                    log.info("lock_limit_auto_posted",
+                             side="YES", max_price=f"${lock_max_price:.2f}",
+                             no_entry=f"${price:.2f}")
+
+    async def _sell_yes(self, pos: MarketMakerPosition, price: float,
+                        remaining: float, reason: str):
+        """Sell YES shares. Allows stop_loss even at a loss."""
+        if not pos.has_yes:
+            return
+        if price <= pos.yes_entry and reason not in ("stop_loss", "time_stop", "force_timeout_30s", "force_cycle_end"):
+            log.info("sell_yes_skipped_would_lose",
+                     price=f"${price:.2f}",
+                     entry=f"${pos.yes_entry:.2f}")
+            return
+
+        gain_pct = (price - pos.yes_entry) / pos.yes_entry
+        log.info("sell_yes_attempt",
+                 reason=reason,
+                 price=f"${price:.2f}",
+                 entry=f"${pos.yes_entry:.2f}",
+                 gain=f"{gain_pct:+.0%}",
+                 remaining=f"{remaining:.0f}s")
+
+        # SL/Time-Stop: tenta taker FOK primeiro, fallback pra maker se falhar
+        if reason in ("stop_loss", "time_stop"):
+            order = await execute_sell_taker(
+                self.order_client, pos.yes_token_id,
+                pos.yes_shares, price
+            )
+            if not order:
+                log.info("sell_yes_taker_failed_trying_maker", price=f"${price:.2f}")
+                order = await execute_sell(
+                    self.order_client, pos.yes_token_id,
+                    pos.yes_shares, price
+                )
+        else:
+            order = await execute_sell(
+                self.order_client, pos.yes_token_id,
+                pos.yes_shares, price
+            )
+        if not order:
+            log.warning("sell_yes_failed", price=f"${price:.2f}")
+            return
+
+        fill_price = price
+        if isinstance(order, dict):
+            fill_price = float(order.get("price", price))
+
+        proceeds = pos.yes_shares * fill_price * (1 - 0.0315)
+        sell_pnl = proceeds - pos.yes_cost
+
+        pos.yes_sold = True
+        pos.yes_sell_price = fill_price
+
+        # Cancelar GTD lock pendente pra evitar compra órfã
+        if pos.pending_lock_order_id:
+            log.info("cancelling_pending_lock_after_sell", order_id=pos.pending_lock_order_id[:20])
+            await self.order_client.cancel_order(pos.pending_lock_order_id)
+            pos.pending_lock_order_id = ""
+
+        log.info("sell_yes_filled",
+                 reason=reason,
+                 pnl=f"${sell_pnl:+.2f}",
+                 sell=f"${fill_price:.2f}",
+                 entry=f"${pos.yes_entry:.2f}")
+
+        # If no other side held, realize PnL now
+        if not pos.has_no:
+            self.risk_manager.update(sell_pnl)
+            try:
+                self.storage.conn.execute(
+                    "UPDATE trades SET result = ?, pnl = ? "
+                    "WHERE timestamp = (SELECT MAX(timestamp) FROM trades)",
+                    [f"SELL_YES_{reason.upper()}", round(sell_pnl, 2)]
+                )
+            except Exception:
+                pass
+            self.cycle_collector.end_cycle(self.poly_feed.yes_price, sell_pnl)
+
+        await self.notifier.send(
+            f"<b>SELL YES</b> ({reason})\n"
+            f"${fill_price:.2f} | PnL: ${sell_pnl:+.2f}"
+        )
+
+    async def _sell_no(self, pos: MarketMakerPosition, price: float,
+                       remaining: float, reason: str):
+        """Sell NO shares. Allows stop_loss even at a loss."""
+        if not pos.has_no:
+            return
+        if price <= pos.no_entry and reason not in ("stop_loss", "time_stop", "force_timeout_30s", "force_cycle_end"):
+            log.info("sell_no_skipped_would_lose",
+                     price=f"${price:.2f}",
+                     entry=f"${pos.no_entry:.2f}")
+            return
+
+        gain_pct = (price - pos.no_entry) / pos.no_entry
+        log.info("sell_no_attempt",
+                 reason=reason,
+                 price=f"${price:.2f}",
+                 entry=f"${pos.no_entry:.2f}",
+                 gain=f"{gain_pct:+.0%}",
+                 remaining=f"{remaining:.0f}s")
+
+        # SL/Time-Stop: tenta taker FOK primeiro, fallback pra maker se falhar
+        if reason in ("stop_loss", "time_stop"):
+            order = await execute_sell_taker(
+                self.order_client, pos.no_token_id,
+                pos.no_shares, price
+            )
+            if not order:
+                log.info("sell_no_taker_failed_trying_maker", price=f"${price:.2f}")
+                order = await execute_sell(
+                    self.order_client, pos.no_token_id,
+                    pos.no_shares, price
+                )
+        else:
+            order = await execute_sell(
+                self.order_client, pos.no_token_id,
+                pos.no_shares, price
+            )
+        if not order:
+            log.warning("sell_no_failed", price=f"${price:.2f}")
+            return
+
+        fill_price = price
+        if isinstance(order, dict):
+            fill_price = float(order.get("price", price))
+
+        proceeds = pos.no_shares * fill_price * (1 - 0.0315)
+        sell_pnl = proceeds - pos.no_cost
+
+        pos.no_sold = True
+        pos.no_sell_price = fill_price
+
+        # Cancelar GTD lock pendente pra evitar compra órfã
+        if pos.pending_lock_order_id:
+            log.info("cancelling_pending_lock_after_sell", order_id=pos.pending_lock_order_id[:20])
+            await self.order_client.cancel_order(pos.pending_lock_order_id)
+            pos.pending_lock_order_id = ""
+
+        log.info("sell_no_filled",
+                 reason=reason,
+                 pnl=f"${sell_pnl:+.2f}",
+                 sell=f"${fill_price:.2f}",
+                 entry=f"${pos.no_entry:.2f}")
+
+        if not pos.has_yes:
+            self.risk_manager.update(sell_pnl)
+            try:
+                self.storage.conn.execute(
+                    "UPDATE trades SET result = ?, pnl = ? "
+                    "WHERE timestamp = (SELECT MAX(timestamp) FROM trades)",
+                    [f"SELL_NO_{reason.upper()}", round(sell_pnl, 2)]
+                )
+            except Exception:
+                pass
+            self.cycle_collector.end_cycle(self.poly_feed.yes_price, sell_pnl)
+
+        await self.notifier.send(
+            f"<b>SELL NO</b> ({reason})\n"
+            f"${fill_price:.2f} | PnL: ${sell_pnl:+.2f}"
+        )
+
+    # ------------------------------------------------------------------
+    # Signal evaluation
+    # ------------------------------------------------------------------
+
+    def _get_signal_direction(self) -> str | None:
+        """
+        Combine all signals to determine trade direction.
+
+        Priority:
+          1. SignalAggregator (Chainlink + Volume + Liquidation + BTC slope)
+          2. Fallback to BTC 2/3 slope if aggregator is indecisive
+        """
+        # BTC slope direction (used by both paths)
+        btc_slope_dir = self._get_btc_slope_direction()
+
+        # Try full signal aggregator first
+        signal = self.signal_agg.evaluate(btc_slope_direction=btc_slope_dir)
+        if signal.direction:
+            log.info("signal_aggregator",
+                     direction=signal.direction,
+                     score=signal.score,
+                     max_score=signal.max_score,
+                     confidence=f"{signal.confidence:.2f}",
+                     signals=signal.signals)
+            return signal.direction
+
+        # Fallback: BTC 2/3 alone
+        if btc_slope_dir:
+            log.info("signal_btc_fallback", direction=btc_slope_dir)
+            return btc_slope_dir
+
+        return None
+
+    def _get_btc_slope_direction(self) -> str | None:
+        """BTC 2/3 filter: majority of 1m/2m/3m slopes agree on direction."""
+        btc_prices = self.btc_buffer.get_prices()
+        if len(btc_prices) < 60:
+            return None
+
+        slopes = {}
+        for label, window in [("1m", 60), ("2m", 120), ("3m", 180)]:
+            n = min(window, len(btc_prices))
+            slopes[label] = calc_slope(btc_prices[-n:])
+
+        up_votes = sum(1 for s in slopes.values() if s > 0)
+        down_votes = 3 - up_votes
+
+        if up_votes >= 2:
+            return "Up"
+        elif down_votes >= 2:
+            return "Down"
+        return None
+
+    # ------------------------------------------------------------------
+    # Market discovery
+    # ------------------------------------------------------------------
+
     async def _find_active_market(self) -> dict | None:
-        """Encontra o mercado BTC 5min ativo mais próximo de resolver."""
+        """Find the currently active 5-min BTC market."""
         if self.current_market:
             remaining = self._get_time_remaining(self.current_market)
-            if remaining > -10:  # Ainda ativo (com margem)
+            if remaining > -10:
                 return self.current_market
 
         markets = await self.poly_rest.get_markets("Bitcoin")
         if not markets:
             return None
 
-        # Pegar o mercado que resolve mais cedo mas ainda tem tempo
         best = None
         for m in markets:
             remaining = self._get_time_remaining(m)
@@ -194,797 +1030,42 @@ class TradingEngine:
 
         if best and best != self.current_market:
             self.current_market = best
-            self._cycle_exited = ""  # Novo ciclo → reset re-entry block
+            self._reset_cycle_flags()
             self.share_buffer.clear()
+
+            # Reset Chainlink cycle for new window
+            self.chainlink_feed.reset_cycle()
+
+            # Connect price feed to new market tokens
             up_token = self._get_yes_token(best)
             down_token = self._get_no_token(best)
             if up_token:
-                asyncio.create_task(self.poly_feed.connect(up_token, down_token))
-            # Iniciar coleta de dados para Excel
+                asyncio.create_task(self.poly_feed.switch_market(up_token, down_token))
+
             self.cycle_collector.start_cycle(
                 market_id=best.get("conditionId", best.get("condition_id", "")),
                 question=best.get("question", "?"),
             )
-            log.info("market_found",
+            log.info("new_cycle",
                      question=best.get("question", "?")[:60],
                      remaining=f"{self._get_time_remaining(best):.0f}s")
 
         return best
 
-    async def _phase_collect(self, market: dict):
-        """Fase de coleta: acumular ticks + capturar snapshots para Excel."""
-        price = self.poly_feed.yes_price
-        if price > 0:
-            delta = self._calculate_delta(price)
-            self.share_buffer.append(time.time(), price, delta)
-            self.cycle_tracker.update_tick(delta)
-            # Snapshot para o Excel
-            time_remaining = self._get_time_remaining(market)
-            self.cycle_collector.capture_snapshot(
-                time_remaining=time_remaining,
-                delta=delta,
-                yes_price=price,
-                btc_price=self.btc_feed.last_price,
-            )
-
-    async def _phase_analyze_and_enter(self, market: dict, time_remaining: float):
-        """
-        Fase de análise e entrada (4:30 → 3:30).
-
-        Estratégia:
-        1. Determinar trend REAL do BTC via Binance (slope dos últimos minutos)
-        2. Ver o que o mercado Polymarket acha (YES price)
-        3. Se mercado CONCORDA com a trend e share está 0.50-0.62 → ENTRAR
-        4. Se mercado DISCORDA da trend → ESPERAR até 3:30 para ver se reverte
-        5. Se não reverteu até ~3:30 → apostar no lado do mercado (>0.50)
-        """
-        # Continuar capturando snapshots para o Excel
-        current_price = self.poly_feed.yes_price
-        if current_price > 0:
-            delta = self._calculate_delta(current_price)
-            self.cycle_collector.capture_snapshot(
-                time_remaining=time_remaining,
-                delta=delta,
-                yes_price=current_price,
-                btc_price=self.btc_feed.last_price,
-            )
-
-        # Bloquear re-entry no mesmo ciclo (dados: re-entry multiplica losses)
-        market_id = market.get("conditionId", market.get("condition_id", ""))
-        if self._cycle_exited and self._cycle_exited == market_id:
-            return
-
-        # Risk check
-        can_trade, reason = self.risk_manager.can_trade()
-        if not can_trade:
-            log.debug("trade_blocked", reason=reason)
-            return
-
-        yes_price = self.poly_feed.yes_price
-        no_price = self.poly_feed.no_price
-        if yes_price <= 0:
-            return
-
-        # ── 1. Determinar trend real do BTC (Binance) — Multi-timeframe ──
-        btc_prices = self.btc_buffer.get_prices()
-        if len(btc_prices) < 60:
-            return
-
-        from core.analyzer import calc_slope
-
-        # 3 timeframes: 1min (60 ticks), 2min (120 ticks), 3min (180 ticks)
-        slopes = {}
-        for label, window in [("1m", 60), ("2m", 120), ("3m", 180)]:
-            n = min(window, len(btc_prices))
-            slopes[label] = calc_slope(btc_prices[-n:])
-
-        # Votos: quantos timeframes dizem Up?
-        up_votes = sum(1 for s in slopes.values() if s > 0)
-        down_votes = 3 - up_votes
-
-        # Trend só é confirmada se 2/3 ou 3/3 concordam
-        if up_votes >= 2:
-            btc_trend = "Up"
-            trend_strength = up_votes  # 2 = moderado, 3 = forte
-        elif down_votes >= 2:
-            btc_trend = "Down"
-            trend_strength = down_votes
-        else:
-            btc_trend = "Neutral"
-            trend_strength = 0
-
-        # ── 2. Ver o que o mercado acha ──
-        if yes_price > 0.50:
-            market_trend = "Up"
-            market_price = yes_price
-        else:
-            market_trend = "Down"
-            market_price = no_price
-
-        # ── 2b. Delta acceleration check ──
-        # Delta alto E caindo = momentum enfraquecendo → possível reversão
-        # Não bloqueia (bons trades acontecem em delta <10), mas reduz sizing
-        share_prices = self.share_buffer.get_prices()
-        delta_falling = False
-        current_delta = 0.0
-        if len(share_prices) >= 6:
-            current_delta = abs(share_prices[-1] - share_prices[0]) * 10000
-            # Calcular delta de 3 ticks atrás
-            mid = len(share_prices) // 2
-            past_delta = abs(share_prices[mid] - share_prices[0]) * 10000
-            # Delta estava alto (>40) e agora caiu → momentum revertendo
-            if past_delta > 40 and current_delta < past_delta * 0.7:
-                delta_falling = True
-                log.info("delta_falling",
-                         current=f"{current_delta:.0f}",
-                         past=f"{past_delta:.0f}",
-                         msg="Momentum enfraquecendo, sizing reduzido")
-
-        # ── 3. Decisão de entrada ──
-
-        # Sem trend clara no BTC → esperar ou seguir mercado no deadline
-        if btc_trend == "Neutral":
-            if time_remaining > ENTRY_CUTOFF + 10:
-                log.info("waiting_trend",
-                         slopes=f"1m={slopes['1m']:.4f} 2m={slopes['2m']:.4f} 3m={slopes['3m']:.4f}",
-                         msg="BTC sem trend clara, esperando")
-                return
-            else:
-                # Deadline: seguir o mercado
-                if 0.48 <= market_price <= 0.56:
-                    direction = market_trend
-                    entry_price = market_price
-                    log.info("entry_deadline_neutral",
-                             market=market_trend,
-                             price=f"${market_price:.2f}",
-                             msg="Sem trend BTC, seguindo mercado no deadline")
-                else:
-                    return
-
-        # BTC trend e mercado CONCORDAM + preço na faixa → ENTRAR
-        elif btc_trend == market_trend and 0.48 <= market_price <= 0.56:
-            direction = market_trend
-            entry_price = market_price
-            log.info("entry_aligned",
-                     btc_trend=btc_trend,
-                     strength=f"{trend_strength}/3",
-                     market=f"${market_price:.2f}",
-                     msg="Trend e mercado concordam")
-
-        # BTC e mercado DISCORDAM → esperar reversão
-        elif btc_trend != market_trend:
-            if time_remaining > ENTRY_CUTOFF + 10:
-                log.info("waiting_reversal",
-                         btc=btc_trend,
-                         strength=f"{trend_strength}/3",
-                         market=market_trend,
-                         price=f"${market_price:.2f}",
-                         remaining=f"{time_remaining:.0f}s")
-                return
-            else:
-                # Deadline: seguir mercado
-                if 0.48 <= market_price <= 0.56:
-                    direction = market_trend
-                    entry_price = market_price
-                    log.info("entry_deadline",
-                             btc=btc_trend,
-                             market=market_trend,
-                             price=f"${market_price:.2f}",
-                             msg="Deadline, seguindo mercado")
-                else:
-                    return
-
-        # Preço fora da faixa
-        elif not (0.48 <= market_price <= 0.56):
-            log.info("skip_price_range",
-                     price=f"${market_price:.2f}")
-            return
-        else:
-            direction = market_trend
-            entry_price = market_price
-
-        expected_return = (1.0 - entry_price) / entry_price
-
-        log.info("entry_signal",
-                 dir=direction,
-                 entry=f"${entry_price:.2f}",
-                 ret=f"{expected_return:.0%}",
-                 btc=f"{btc_trend}({trend_strength}/3)",
-                 yes=f"${yes_price:.2f}")
-
-        # ── Calcular Sizing ──
-        # Rodar análise completa para confiança e dados
-        analysis = run_analysis(
-            self.share_buffer,
-            self.btc_buffer,
-            self.cycle_tracker,
-            current_price
-        )
-        confidence = analysis.confidence if analysis else 0.0
-
-        bet_size = calculate_bet_size(
-            confidence=confidence,
-            expected_return=expected_return,
-            time_remaining=time_remaining,
-            direction=direction,
-            consecutive_losses=self.risk_manager.state.consecutive_losses,
-            consecutive_wins=self.risk_manager.state.consecutive_wins,
-            is_drawdown=self.risk_manager.is_drawdown,
-            is_squeeze_breakout=analysis.is_squeeze_breakout if analysis else False,
-            entry_price=entry_price,
-            trend_strength=trend_strength,
-        )
-
-        # (sizing fixo via kelly-lite — sem delta_falling)
-
-        # ── EXECUTAR TRADE ──
-        token_id = self._get_yes_token(market) if direction == "Up" \
-            else self._get_no_token(market)
-
-        if not token_id:
-            return
-
-        order = await execute_trade(
-            self.order_client, token_id,
-            direction, bet_size, entry_price
-        )
-
-        if order:
-            shares = max(bet_size / entry_price, 5.0)  # Mínimo 5 (Polymarket enforces)
-            actual_cost = shares * entry_price
-            self.current_position = Position(
-                direction=direction,
-                bet_size=actual_cost,
-                entry_price=entry_price,
-                potential_return=shares,
-                shares=shares,
-                entry_time=time.time(),
-                market_id=market.get("conditionId", market.get("condition_id", "")),
-                token_id=token_id,
-                entry_confidence=analysis.confidence,
-                entry_alignment=int(analysis.layer2_alignment)
-            )
-            # Salvar volume no momento da entrada para ev_optimal dinâmico
-            self.current_position.entry_volume_imbalance = \
-                getattr(analysis, 'volume_imbalance', 0.0) if analysis else 0.0
-
-            self.cycle_collector.record_trade(
-                direction=direction,
-                size=bet_size,
-                entry_price=entry_price,
-            )
-
-            log.info("trade_executed",
-                     direction=direction,
-                     size=f"${bet_size}",
-                     price=f"${entry_price:.2f}",
-                     ret=f"{expected_return:.0%}",
-                     streak=f"W{self.risk_manager.state.consecutive_wins}",
-                     time_slot=get_time_slot(time_remaining))
-
-            await self.notifier.notify_trade(
-                direction, bet_size, entry_price,
-                analysis.confidence, analysis.regime
-            )
-
-            # Log para storage
-            self.storage.log_trade({
-                "timestamp": time.time(),
-                "market_id": market.get("conditionId", market.get("condition_id", "")),
-                "direction": direction,
-                "bet_size": bet_size,
-                "entry_price": entry_price,
-                "entry_time_remaining": time_remaining,
-                "confidence_score": confidence,
-                "expected_return": expected_return,
-            })
-
-    async def _phase_late_entry(self, market: dict, time_remaining: float):
-        """
-        Entry tardio (3:30 → 2:00) para mercados que ficaram indecisos.
-        Só entra se agora a share saiu do range lateral ($0.45-$0.55) e tem direção.
-        Sizing máximo $2 (menos edge que entry cedo).
-        """
-        yes_price = self.poly_feed.yes_price
-        no_price = self.poly_feed.no_price
-        if yes_price <= 0:
-            return
-
-        # Snapshot para Excel
-        delta = self._calculate_delta(yes_price)
-        self.cycle_collector.capture_snapshot(
-            time_remaining=time_remaining,
-            delta=delta,
-            yes_price=yes_price,
-            btc_price=self.btc_feed.last_price,
-        )
-
-        # Bloquear re-entry no mesmo ciclo
-        market_id = market.get("conditionId", market.get("condition_id", ""))
-        if self._cycle_exited and self._cycle_exited == market_id:
-            return
-
-        # Risk check
-        can_trade, reason = self.risk_manager.can_trade()
-        if not can_trade:
-            return
-
-        # Só entrar se a share SAIU do range indeciso
-        if 0.55 < yes_price <= 0.60:
-            direction = "Up"
-            entry_price = yes_price
-        elif 0.55 < no_price <= 0.60:
-            direction = "Down"
-            entry_price = no_price
-        else:
-            return  # Ainda indeciso ou fora de range
-
-        expected_return = (1.0 - entry_price) / entry_price
-
-        log.info("late_entry_signal",
-                 dir=direction,
-                 entry=f"${entry_price:.2f}",
-                 ret=f"{expected_return:.0%}",
-                 remaining=f"{time_remaining:.0f}s")
-
-        bet_size = calculate_bet_size(
-            confidence=0.0,
-            expected_return=expected_return,
-            time_remaining=time_remaining,
-            direction=direction,
-            consecutive_losses=self.risk_manager.state.consecutive_losses,
-            consecutive_wins=self.risk_manager.state.consecutive_wins,
-            is_drawdown=self.risk_manager.is_drawdown,
-            entry_price=entry_price,
-            trend_strength=2,
-        )
-
-        token_id = self._get_yes_token(market) if direction == "Up" \
-            else self._get_no_token(market)
-        if not token_id:
-            return
-
-        order = await execute_trade(
-            self.order_client, token_id,
-            direction, bet_size, entry_price
-        )
-
-        if order:
-            shares = max(bet_size / entry_price, 5.0)
-            actual_cost = shares * entry_price
-            self.current_position = Position(
-                direction=direction,
-                bet_size=actual_cost,
-                entry_price=entry_price,
-                potential_return=shares,
-                shares=shares,
-                entry_time=time.time(),
-                market_id=market.get("conditionId", market.get("condition_id", "")),
-                token_id=token_id,
-            )
-
-            # Sem GTC no book — ev_optimal gerencia exits via código
-            # (GTC orders viram zumbis se não canceladas na resolução)
-
-            self.cycle_collector.record_trade(direction, actual_cost, entry_price)
-            log.info("late_trade_executed",
-                     direction=direction,
-                     size=f"${bet_size}",
-                     price=f"${entry_price:.2f}",
-                     ret=f"{expected_return:.0%}")
-            self.storage.log_trade({
-                "timestamp": time.time(),
-                "market_id": market.get("conditionId", market.get("condition_id", "")),
-                "direction": direction,
-                "bet_size": bet_size,
-                "entry_price": entry_price,
-                "entry_time_remaining": time_remaining,
-                "expected_return": expected_return,
-            })
-
-    async def _phase_monitor(self, market: dict, time_remaining: float):
-        """Fase de monitoramento: só exits de LUCRO. Perdendo = hold to resolution."""
-        # Snapshots para Excel
-        yes_price = self.poly_feed.yes_price
-        if yes_price > 0:
-            delta = self._calculate_delta(yes_price)
-            self.cycle_collector.capture_snapshot(
-                time_remaining=time_remaining,
-                delta=delta,
-                yes_price=yes_price,
-                btc_price=self.btc_feed.last_price,
-            )
-
-        pos = self.current_position
-        if not pos or pos.exited_early:
-            return
-
-        # ── 0. CHECK PROFIT SELL FILL (entry + $0.20) ──
-        if getattr(pos, '_limit_sell_active', False) and getattr(pos, '_limit_sell_id', None):
-            filled = await self.order_client._wait_for_fill(pos._limit_sell_id, timeout=0.5)
-            if filled:
-                sell_qty = pos._limit_sell_qty
-                sell_price = pos._limit_sell_price
-                pnl = sell_qty * sell_price * (1 - 0.0315) - pos.bet_size
-                pos.exited_early = True
-                pos.exit_price = sell_price
-                pos.exit_reason = "profit_sell_filled"
-                pos._limit_sell_active = False
-                self.risk_manager.update(pnl)
-                # Cancelar stop loss sell
-                if getattr(pos, '_sl_sell_active', False) and getattr(pos, '_sl_sell_id', None):
-                    await self.order_client.cancel_order(pos._sl_sell_id)
-                    pos._sl_sell_active = False
-                log.info("profit_sell_filled",
-                         pnl=f"${pnl:+.2f}",
-                         price=f"${sell_price:.2f}",
-                         entry=f"${pos.entry_price:.2f}")
-                self._cycle_exited = pos.market_id
-                self.cycle_collector.end_cycle(yes_price, pnl)
-                self.current_position = None
-                self.share_buffer.clear()
-                return
-
-        # ── 1. EXITS DE LUCRO — perdendo = hold to resolution (sem SL) ──
-        current_delta = abs(self._calculate_delta(yes_price)) if yes_price > 0 else 0
-        if yes_price > 0:
-            # Volume imbalance: usa o da última análise de entrada (salvo na posição)
-            vol_imb = getattr(pos, 'entry_volume_imbalance', 0.0)
-
-            exit_eval = evaluate_early_exit(
-                direction=pos.direction,
-                entry_price=pos.entry_price,
-                shares=pos.shares,
-                cost_basis=pos.bet_size,
-                current_yes_price=yes_price,
-                time_remaining=time_remaining,
-                current_delta=current_delta,
-                volume_imbalance=vol_imb,
-            )
-
-            # Log avaliação a cada 30s para debug
-            if int(time_remaining) % 30 < 3:
-                our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
-                gain = (our_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0
-                drop = (pos.entry_price - our_price) / pos.entry_price if pos.entry_price > 0 else 0
-                log.info("exit_eval",
-                         our=f"${our_price:.2f}",
-                         gain=f"{gain:.0%}",
-                         shares=f"{pos.shares:.1f}",
-                         can_sell=pos.shares >= 5,
-                         should=exit_eval.should_exit,
-                         reason=exit_eval.reason or "none",
-                         remaining=f"{time_remaining:.0f}s")
-
-            if exit_eval.should_exit:
-                # Cancelar AMBOS limit sells antes de vender no market
-                if getattr(pos, '_limit_sell_active', False) and getattr(pos, '_limit_sell_id', None):
-                    await self.order_client.cancel_order(pos._limit_sell_id)
-                    pos._limit_sell_active = False
-                if getattr(pos, '_sl_sell_active', False) and getattr(pos, '_sl_sell_id', None):
-                    await self.order_client.cancel_order(pos._sl_sell_id)
-                    pos._sl_sell_active = False
-
-                order = None
-                for pct in [1.0, 0.95, 0.90, 0.85]:
-                    sell_qty = round(pos.shares * pct, 2)
-                    order = await execute_sell(
-                        self.order_client, pos.token_id,
-                        sell_qty, exit_eval.sell_price,
-                    )
-                    if order:
-                        log.info("sell_executed",
-                                 qty=sell_qty,
-                                 price=f"${exit_eval.sell_price:.2f}",
-                                 pct=f"{pct:.0%}")
-                        break
-
-                # Se tem recovery sell pendente e agora estamos vendendo de verdade, cancelar
-                if getattr(pos, '_recovery_sell_pending', False) and pos._recovery_sell_order_id:
-                    await self.order_client.cancel_order(pos._recovery_sell_order_id)
-                    pos._recovery_sell_pending = False
-                    log.info("sl_recovery_cancelled", msg="Recovery sell cancelada, vendendo no mercado")
-
-                if order:
-                    pnl = exit_eval.sell_pnl
-                    # Contabilizar custo do hedge (se existir)
-                    if pos.has_hedge:
-                        pnl -= pos.hedge_cost
-                    pos.exited_early = True
-                    pos.exit_price = exit_eval.sell_price
-                    pos.exit_proceeds = exit_eval.sell_proceeds
-                    pos.exit_reason = exit_eval.reason
-                    self.risk_manager.update(pnl)
-
-                    log.info("early_exit",
-                             reason=exit_eval.reason,
-                             pnl=f"${pnl:+.2f}",
-                             sell=f"${exit_eval.sell_price:.2f}",
-                             entry=f"${pos.entry_price:.2f}",
-                             hedge_cost=f"${pos.hedge_cost:.2f}" if pos.has_hedge else "none",
-                             gain=f"{exit_eval.gain_pct:.0%}")
-
-                    try:
-                        self.storage.conn.execute(
-                            "UPDATE trades SET result = ?, pnl = ? "
-                            "WHERE timestamp = (SELECT MAX(timestamp) FROM trades)",
-                            [f"EARLY_{exit_eval.reason.upper()}", round(pnl, 2)]
-                        )
-                    except Exception:
-                        pass
-
-                    self.cycle_collector.end_cycle(yes_price, pnl)
-                    self._cycle_exited = pos.market_id  # Bloquear re-entry neste ciclo
-                    self.current_position = None
-                    self.share_buffer.clear()
-                    return
-
-        # ── HOLD TO RESOLUTION — sem lock, sem hedge ──
-        # Dados: hedges custaram -$15 num dia, locks destruíram winners
-        # 67% accuracy × resolução binária = melhor que qualquer exit de loss
-        return
-
-        # ── CÓDIGO ABAIXO DESATIVADO (mantido pra referência) ──
-        # ── 2. LOCK PROFIT — SÓ quando estamos PERDENDO ──
-        # Se share está acima do entry (ganhando) → não fazer lock, deixar take profit/safety sell agir
-        # Se share caiu abaixo do entry (perdendo) → lock para garantir que não perde tudo
-        our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
-        is_losing = our_price < pos.entry_price * 0.90  # Share caiu 10%+ do entry
-
-        if not pos.has_lock and not pos.has_hedge and time_remaining > 30 and is_losing:
-            opp_dir = "Down" if pos.direction == "Up" else "Up"
-            opp_token = self._get_no_token(market) if pos.direction == "Up" \
-                else self._get_yes_token(market)
-
-            if opp_token:
-                # Buscar preço real do lado oposto
-                price_b = await self.poly_rest.get_best_ask(opp_token)
-                if price_b is None:
-                    # Fallback: derivar do yes_price + buffer de spread
-                    derived = self.poly_feed.no_price if pos.direction == "Up" \
-                        else self.poly_feed.yes_price
-                    price_b = derived + 0.02  # Conservative spread
-
-                lock_opp = evaluate_lock(
-                    price_a=pos.entry_price,
-                    price_b=price_b,
-                    direction_b=opp_dir,
-                    token_id_b=opp_token,
-                    shares_a=pos.shares,
-                )
-
-                if lock_opp:
-                    order = await execute_lock(
-                        self.order_client, opp_token,
-                        lock_opp.price_b, lock_opp.shares,
-                    )
-                    if order:
-                        pos.has_lock = True
-                        pos.lock_price_b = lock_opp.price_b
-                        pos.lock_shares = lock_opp.shares
-                        pos.lock_guaranteed_profit = lock_opp.profit_total
-                        pos.lock_side_b_direction = opp_dir
-                        pos.lock_side_b_token_id = opp_token
-
-                        log.info("lock_profit_executed",
-                                 profit=f"${lock_opp.profit_total:.2f}",
-                                 a=f"${pos.entry_price:.2f}",
-                                 b=f"${lock_opp.price_b:.2f}",
-                                 sum=f"${pos.entry_price + lock_opp.price_b:.2f}")
-                        return  # Lock acquired, skip hedge
-
-        # Se lock ativo, não precisa de hedge
-        if pos.has_lock:
-            return
-
-        # ── 3. HEDGE ──
-        # Avaliar hedge se: momentum inverteu OU nossa share caiu muito
-        share_prices = self.share_buffer.get_prices()
-        btc_prices = self.btc_buffer.get_prices()
-        if len(share_prices) < 5:
-            return
-
-        # Check direto: nossa share caiu abaixo de $0.40?
-        our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
-        price_dropped = our_price < 0.40
-
-        current_momentum = calc_momentum(share_prices)
-        from core.analyzer import analyze_layer2_multiTF
-        current_alignment_score, current_alignment = analyze_layer2_multiTF(
-            btc_prices, pos.direction
-        )
-
-        should_eval = should_evaluate_hedge(pos, current_momentum, current_alignment) or price_dropped
-        if should_eval:
-            loss_prob = estimate_loss_probability(
-                pos, current_momentum,
-                current_alignment, pos.entry_alignment
-            )
-
-            opposite_direction = "Down" if pos.direction == "Up" else "Up"
-            hedge_token = self._get_no_token(market) if pos.direction == "Up" \
-                else self._get_yes_token(market)
-
-            if hedge_token:
-                hedge_price = 1 - self.poly_feed.yes_price if pos.direction == "Up" \
-                    else self.poly_feed.yes_price
-
-                if hedge_price < 0.50:
-                    return
-
-                hedge_cost = min(pos.bet_size * 0.6, 3)  # Max 60% da original ou $3
-                hedge_return = hedge_cost / hedge_price if hedge_price > 0 else 0
-
-                hedge_opp = HedgeOpportunity(
-                    direction=opposite_direction,
-                    cost=hedge_cost,
-                    potential_return=hedge_return,
-                    price=hedge_price,
-                    token_id=hedge_token
-                )
-
-                should_hedge, reason, savings = should_execute_hedge(
-                    pos, hedge_opp, loss_prob, self.hedge_tracker
-                )
-
-                if should_hedge:
-                    order = await execute_hedge(
-                        self.order_client, hedge_token,
-                        hedge_cost, hedge_price
-                    )
-                    if order:
-                        # Registrar hedge na posição para PnL correto
-                        pos.has_hedge = True
-                        pos.hedge_cost = hedge_cost
-                        pos.hedge_price = hedge_price
-                        pos.hedge_direction = opposite_direction
-                        pos.hedge_potential_return = hedge_return
-
-                        self.hedge_tracker.record_hedge(hedge_cost, savings)
-                        log.info("hedge_executed",
-                                 cost=f"${hedge_cost:.2f}",
-                                 savings=f"${savings:.2f}",
-                                 loss_prob=f"{loss_prob:.0%}")
-                        await self.notifier.notify_hedge(hedge_cost, savings)
-                else:
-                    log.debug("hedge_skipped", reason=reason)
-
-    async def _phase_resolve(self, market: dict):
-        """Fase de resolução: verificar resultado e atualizar stats."""
-        pos = self.current_position
-        if not pos:
-            self.cycle_tracker.end_cycle()
-            self.share_buffer.clear()
-            return
-
-        # Cancelar TODAS ordens abertas antes de resolver — evita zumbis
-        cancel_ids = []
-        if getattr(pos, '_limit_sell_active', False) and getattr(pos, '_limit_sell_id', None):
-            cancel_ids.append(pos._limit_sell_id)
-            pos._limit_sell_active = False
-        if getattr(pos, '_sl_sell_active', False) and getattr(pos, '_sl_sell_id', None):
-            cancel_ids.append(pos._sl_sell_id)
-            pos._sl_sell_active = False
-        if cancel_ids:
-            await asyncio.gather(
-                *[self.order_client.cancel_order(oid) for oid in cancel_ids],
-                return_exceptions=True
-            )
-            log.info("resolve_cancelled_open_orders", count=len(cancel_ids))
-
-        # Determinar resultado
-        final_price = self.poly_feed.yes_price
-        up_won = final_price > 0.5
-
-        # PnL da posição principal
-        main_won = (pos.direction == "Up" and up_won) or \
-                   (pos.direction == "Down" and not up_won)
-
-        if main_won:
-            # Shares * $1 - custo, menos fee 10% sobre lucro
-            fee = (1.0 - pos.entry_price) * 0.10 * pos.shares
-            main_pnl = pos.shares * 1.0 - pos.bet_size - fee
-        else:
-            main_pnl = -pos.bet_size
-
-        # PnL do lock profit (se existir) — um lado sempre ganha
-        lock_pnl = 0.0
-        if pos.has_lock:
-            lock_won = (pos.lock_side_b_direction == "Up" and up_won) or \
-                       (pos.lock_side_b_direction == "Down" and not up_won)
-            lock_cost = pos.lock_price_b * pos.lock_shares
-            if lock_won:
-                lock_fee = (1.0 - pos.lock_price_b) * 0.10 * pos.lock_shares
-                lock_pnl = pos.lock_shares * 1.0 - lock_cost - lock_fee
-            else:
-                lock_pnl = -lock_cost
-
-        # PnL do hedge (se existir)
-        hedge_pnl = 0.0
-        if pos.has_hedge:
-            hedge_won = (pos.hedge_direction == "Up" and up_won) or \
-                        (pos.hedge_direction == "Down" and not up_won)
-            if hedge_won:
-                hedge_pnl = pos.hedge_potential_return - pos.hedge_cost
-            else:
-                hedge_pnl = -pos.hedge_cost
-
-        # PnL total
-        pnl = main_pnl + lock_pnl + hedge_pnl
-        won = pnl > 0
-
-        self.risk_manager.update(pnl)
-
-        result = "WIN" if won else "LOSS"
-        log.info("trade_resolved",
-                 result=result,
-                 pnl=f"${pnl:+.2f}",
-                 main=f"${main_pnl:+.2f}",
-                 lock=f"${lock_pnl:+.2f}" if pos.has_lock else "none",
-                 hedge=f"${hedge_pnl:+.2f}" if pos.has_hedge else "none",
-                 pnl_today=f"${self.risk_manager.state.pnl_today:+.2f}",
-                 direction=pos.direction)
-
-        # Atualizar resultado no DuckDB
-        try:
-            self.storage.conn.execute(
-                "UPDATE trades SET result = ?, pnl = ?, resolution_price = ? "
-                "WHERE timestamp = (SELECT MAX(timestamp) FROM trades)",
-                [result, round(pnl, 2), round(final_price, 4)]
-            )
-        except Exception as e:
-            log.error("storage_update_error", error=str(e))
-
-        await self.notifier.notify_result(
-            won, pnl, self.risk_manager.state.pnl_today
-        )
-
-        # Salvar dados do ciclo no Excel
-        self.cycle_collector.end_cycle(
-            final_yes_price=final_price,
-            pnl=pnl,
-        )
-
-        # Cleanup
-        self.current_position = None
-        self.cycle_tracker.end_cycle()
-        self.share_buffer.clear()
-
-    # ── Helpers ──────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _calculate_delta(self, current_price: float) -> float:
-        """Calcula delta: diferença do preço atual vs início do ciclo."""
         prices = self.share_buffer.get_prices()
         if len(prices) < 2:
             return 0.0
-        first_price = prices[0]
-        return (current_price - first_price) * 10000  # Em "pontos"
-
-    def _find_entry_price(
-        self, direction: str, current_price: float, time_remaining: float
-    ) -> float | None:
-        """
-        Encontra o preço de entrada.
-        Range: $0.50 a $0.62 (retorno de 33% a 100%).
-        """
-        if direction == "Up":
-            price = current_price
-            if price < 0.50 or price > 0.62:
-                return None
-            return price
-        else:
-            price = 1 - current_price  # Preço da NO share
-            if price < 0.50 or price > 0.62:
-                return None
-            return price
+        return (current_price - prices[0]) * 10000
 
     def _get_time_remaining(self, market: dict) -> float:
-        """Calcula segundos restantes até resolução."""
-        # Mercados 5min usam _window_end_ts (timestamp Unix do fim da janela)
         window_end = market.get("_window_end_ts")
         if window_end:
             return window_end - time.time()
-        # Fallback para endDateIso
         end_str = market.get("endDateIso", market.get("end_date_iso", ""))
         if not end_str:
             return 0
@@ -995,16 +1076,7 @@ class TradingEngine:
         except Exception:
             return 0
 
-    def _parse_remaining(self, end_str: str) -> float | None:
-        try:
-            from datetime import datetime as dt, timezone
-            end_dt = dt.fromisoformat(end_str.replace("Z", "+00:00"))
-            return (end_dt - dt.now(timezone.utc)).total_seconds()
-        except Exception:
-            return None
-
     def _get_token_ids(self, market: dict) -> list[str]:
-        """Extrai clobTokenIds como lista."""
         token_ids = market.get("clobTokenIds", [])
         if isinstance(token_ids, str):
             import json
@@ -1015,17 +1087,27 @@ class TradingEngine:
         return token_ids
 
     def _get_yes_token(self, market: dict) -> str | None:
-        """Retorna o token ID de Up/YES (índice 0 em clobTokenIds)."""
         token_ids = self._get_token_ids(market)
-        # Mercados 5min BTC: outcomes = ["Up", "Down"] → index 0 = Up
-        if token_ids:
-            return token_ids[0]
-        return None
+        return token_ids[0] if token_ids else None
 
     def _get_no_token(self, market: dict) -> str | None:
-        """Retorna o token ID de Down/NO (índice 1 em clobTokenIds)."""
         token_ids = self._get_token_ids(market)
-        # Mercados 5min BTC: outcomes = ["Up", "Down"] → index 1 = Down
-        if len(token_ids) > 1:
-            return token_ids[1]
-        return None
+        return token_ids[1] if len(token_ids) > 1 else None
+
+    def _reset_cycle_flags(self):
+        """Reset per-cycle state."""
+        # Cancel pending lock order if exists
+        if self.position and self.position.pending_lock_order_id:
+            asyncio.ensure_future(
+                self.order_client.cancel_order(self.position.pending_lock_order_id)
+            )
+        self._bought_yes_this_cycle = False
+        self._bought_no_this_cycle = False
+        self.position = None
+
+    def _clean_up_cycle(self):
+        """Full cleanup after a cycle resolves."""
+        self.position = None
+        self.cycle_tracker.end_cycle()
+        self.share_buffer.clear()
+        self._reset_cycle_flags()

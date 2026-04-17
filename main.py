@@ -20,7 +20,7 @@ def run_dashboard(engine):
     import uvicorn
     from dashboard.api import app, set_engine
     set_engine(engine)
-    uvicorn.run(app, host="0.0.0.0", port=8888, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=8889, log_level="warning")
 
 
 def main():
@@ -46,7 +46,7 @@ def main():
         # Dashboard em thread separada
         dash_thread = threading.Thread(target=run_dashboard, args=(engine,), daemon=True)
         dash_thread.start()
-        log.info("dashboard_started", url="http://localhost:8888")
+        log.info("dashboard_started", url="http://localhost:8889")
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)

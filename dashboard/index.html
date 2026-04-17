@@ -323,7 +323,7 @@
       <div class="card-title">Recent Trades</div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Time</th><th>Dir</th><th>Size</th><th>Price</th><th>Conf</th><th>Result</th><th>P&L</th></tr></thead>
+          <thead><tr><th>Time</th><th>Dir</th><th>Size</th><th>Price</th><th>Result</th><th>P&L</th></tr></thead>
           <tbody id="tradesBody"><tr><td colspan="7" style="text-align:center;color:var(--text-muted)">No trades yet</td></tr></tbody>
         </table>
       </div>
@@ -414,18 +414,18 @@
         document.getElementById('priceBtc').textContent = d.prices.btc > 0 ? '$'+d.prices.btc.toLocaleString() : '--';
       }
 
-      // KPIs
-      if (d.risk) {
-        const pnl = d.risk.pnl_today || 0;
+      // KPIs — PnL do dia inteiro (desde 8AM, direto do DB)
+      if (d.daily) {
+        const pnl = d.daily.pnl || 0;
         const el = document.getElementById('kpiPnl');
         el.textContent = `$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`;
         el.className = 'metric-value ' + (pnl >= 0 ? 'positive' : 'negative');
 
-        document.getElementById('kpiTrades').textContent = d.risk.trades_today || 0;
-        document.getElementById('kpiDrawdown').textContent = `$${(d.risk.drawdown||0).toFixed(2)}`;
+        document.getElementById('kpiTrades').textContent = `${d.daily.wins}W / ${d.daily.losses}L`;
+        document.getElementById('kpiDrawdown').textContent = `${d.daily.locks} locks`;
 
-        const cw = d.risk.consecutive_wins || 0;
-        const cl = d.risk.consecutive_losses || 0;
+        const cw = d.risk?.consecutive_wins || 0;
+        const cl = d.risk?.consecutive_losses || 0;
         const streakEl = document.getElementById('kpiStreak');
         if (cw > 0) { streakEl.textContent = `W${cw}`; streakEl.className = 'metric-value positive'; }
         else if (cl > 0) { streakEl.textContent = `L${cl}`; streakEl.className = 'metric-value negative'; }
@@ -435,13 +435,17 @@
       // Position
       const posDiv = document.getElementById('positionInfo');
       if (d.position) {
-        const dir = d.position.direction;
+        const p = d.position;
+        const lockLabel = p.locked ? `<span class="positive">LOCKED +$${p.locked_profit}</span>` : 'Open';
+        const sides = [];
+        if (p.yes_entry) sides.push(`YES $${p.yes_entry}`);
+        if (p.no_entry) sides.push(`NO $${p.no_entry}`);
         posDiv.innerHTML = `
-          <div style="font-size:36px; font-weight:700;" class="${dir==='Up'?'positive':'negative'}">${dir}</div>
+          <div style="font-size:28px; font-weight:700;">${lockLabel}</div>
           <div style="margin-top:12px; font-size:13px; color:var(--text-muted);">
-            <div>Size: <b style="color:var(--text)">$${d.position.bet_size}</b></div>
-            <div style="margin-top:4px">Entry: <b style="color:var(--text)">${d.position.entry_price}</b></div>
-            <div style="margin-top:4px">Conf: <b style="color:var(--text)">${d.position.confidence}</b></div>
+            <div>${sides.join(' + ')}</div>
+            <div style="margin-top:4px">Cost: <b style="color:var(--text)">$${p.total_cost}</b></div>
+            <div style="margin-top:4px">Shares: <b style="color:var(--text)">Y${p.yes_shares} / N${p.no_shares}</b></div>
           </div>`;
       } else {
         posDiv.innerHTML = `
@@ -483,15 +487,15 @@
       tbody.innerHTML = data.slice(0,30).map(t => {
         const dt = new Date(t.timestamp * 1000);
         const time = dt.toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit'});
-        const dirClass = t.direction === 'Up' ? 'badge-up' : 'badge-down';
-        const resClass = t.result === 'WIN' ? 'badge-win' : (t.result === 'LOSS' ? 'badge-loss' : '');
+        const dir = t.direction || '--';
+        const dirClass = dir === 'Up' ? 'badge-up' : 'badge-down';
+        const resClass = (t.result||'').includes('WIN') ? 'badge-win' : ((t.result||'').includes('LOSS') ? 'badge-loss' : '');
         const pnlClass = (t.pnl||0) >= 0 ? 'positive' : 'negative';
         return `<tr>
           <td>${time}</td>
-          <td><span class="badge ${dirClass}">${t.direction}</span></td>
-          <td>$${t.bet_size}</td>
+          <td><span class="badge ${dirClass}">${dir}</span></td>
+          <td>$${t.bet_size||'--'}</td>
           <td>${(t.entry_price||0).toFixed(3)}</td>
-          <td>${(t.confidence_score||0).toFixed(1)}</td>
           <td>${t.result ? `<span class="badge ${resClass}">${t.result}</span>` : '--'}</td>
           <td class="${pnlClass}">${t.pnl != null ? '$'+(t.pnl>=0?'+':'')+t.pnl.toFixed(2) : '--'}</td>
         </tr>`;

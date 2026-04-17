@@ -113,7 +113,7 @@ def analyze_layer2_multiTF(
         return 0.0, 0
 
     slopes = []
-    for window in [10, 30, 60]:
+    for window in [60, 120, 180]:  # 1min, 2min, 3min a 1s/tick
         n = min(window, len(btc_prices))
         s = calc_slope(btc_prices[-n:])
         slopes.append(s)

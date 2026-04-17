@@ -39,8 +39,31 @@ async def get_status():
         return {"error": "Engine not initialized"}
 
     rm = _engine.risk_manager
-    pos = _engine.current_position
+    pos = _engine.position
     market = _engine.current_market
+
+    # PnL desde o reset (13:07 BRT = 16:07 UTC, banca $39)
+    PNL_RESET_TS = 1776436060  # 2026-04-17T16:07:40Z
+    daily_pnl = 0.0
+    daily_trades = 0
+    daily_wins = 0
+    daily_losses = 0
+    daily_locks = 0
+    try:
+        today_ts = PNL_RESET_TS
+        row = _engine.storage.conn.execute("""
+            SELECT COALESCE(SUM(pnl), 0),
+                   COUNT(*),
+                   COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN result LIKE '%LOCK%' THEN 1 ELSE 0 END), 0)
+            FROM trades
+            WHERE timestamp >= ? AND result IS NOT NULL
+        """, [today_ts]).fetchone()
+        if row:
+            daily_pnl, daily_trades, daily_wins, daily_losses, daily_locks = row
+    except Exception:
+        pass
 
     return {
         "running": _engine.running,
@@ -51,21 +74,26 @@ async def get_status():
             "time_remaining": round(_engine._get_time_remaining(market), 1) if market else 0,
         } if market else None,
         "position": {
-            "direction": pos.direction,
-            "bet_size": pos.bet_size,
-            "entry_price": round(pos.entry_price, 4),
-            "confidence": round(pos.entry_confidence, 1),
+            "yes_entry": round(pos.yes_entry, 4) if pos.yes_entry else None,
+            "no_entry": round(pos.no_entry, 4) if pos.no_entry else None,
+            "yes_shares": pos.yes_shares,
+            "no_shares": pos.no_shares,
+            "locked": pos.is_locked,
+            "locked_profit": round(pos.locked_profit, 2) if pos.is_locked else None,
+            "total_cost": round(pos.total_cost, 2),
         } if pos else None,
         "risk": rm.get_summary(),
+        "daily": {
+            "pnl": round(daily_pnl, 2),
+            "trades": daily_trades,
+            "wins": daily_wins,
+            "losses": daily_losses,
+            "locks": daily_locks,
+        },
         "prices": {
             "yes": round(_engine.poly_feed.yes_price, 4),
             "no": round(_engine.poly_feed.no_price, 4),
             "btc": round(_engine.btc_feed.last_price, 2),
-        },
-        "hedge_tracker": {
-            "hedges_today": _engine.hedge_tracker.hedges_today,
-            "total_cost": round(_engine.hedge_tracker.total_hedge_cost, 2),
-            "total_savings": round(_engine.hedge_tracker.total_hedge_savings, 2),
         },
     }
 

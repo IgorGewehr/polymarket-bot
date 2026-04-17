@@ -86,13 +86,18 @@ class PolymarketFeed:
                     close_timeout=5
                 ) as ws:
                     self.ws = ws
-                    # Subscribe com formato correto: type=market, assets_ids=[token_id]
+                    # Subscribe em ambos YES e NO tokens para preços reais
+                    asset_ids = [market_token_id]
+                    if down_token_id:
+                        asset_ids.append(down_token_id)
                     sub_msg = orjson.dumps({
                         "type": "market",
-                        "assets_ids": [market_token_id]
+                        "assets_ids": asset_ids
                     }).decode()
                     await ws.send(sub_msg)
-                    log.info("polymarket_subscribed", market=market_token_id[:16])
+                    log.info("polymarket_subscribed",
+                             yes_token=market_token_id[:16],
+                             no_token=(down_token_id or "none")[:16])
 
                     async for msg in ws:
                         if not self._running:
@@ -136,17 +141,18 @@ class PolymarketFeed:
             pass
 
     def _update_price(self, asset_id: str, price: float):
-        """Atualiza yes_price com base no token que atualizou."""
+        """Atualiza preços com base no token. Usa dados reais, não derivados."""
         if asset_id == self.up_token_id:
-            # Update direto: preço do token Up = yes_price
             self.yes_price = price
-            self.no_price = 1 - price
+            # Só deriva NO se não temos dados reais do NO ainda
+            if self.no_price <= 0:
+                self.no_price = 1 - price
         elif asset_id == self.down_token_id:
-            # Token Down: yes_price = 1 - down_price
             self.no_price = price
-            self.yes_price = 1 - price
+            # Só deriva YES se não temos dados reais do YES ainda
+            if self.yes_price <= 0:
+                self.yes_price = 1 - price
         else:
-            # Token desconhecido — assumir que é o Up
             self.yes_price = price
             self.no_price = 1 - price
         self.buffer.append(timestamp=time.time(), price=self.yes_price)
