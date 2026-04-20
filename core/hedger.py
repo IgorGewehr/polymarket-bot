@@ -33,6 +33,8 @@ class Position:
     hedge_direction: str = ""
     hedge_potential_return: float = 0.0
     has_hedge: bool = False
+    hedge_token_id: str = ""
+    hedge_exited: bool = False
     # Lock profit tracking
     has_lock: bool = False
     lock_price_b: float = 0.0

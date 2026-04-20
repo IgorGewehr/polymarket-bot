@@ -11,7 +11,8 @@ from config.settings import (
     TICK_INTERVAL, ENTRY_WINDOW_START, ENTRY_WINDOW_SOFT,
     ENTRY_DEADLINE, ENTRY_CUTOFF, MIN_TIME_REMAINING,
     MIN_DELTA, MIN_RETURN_PCT, MIN_CONFIDENCE,
-    BUFFER_SIZE, BTC_BUFFER_SIZE, DRY_RUN
+    BUFFER_SIZE, BTC_BUFFER_SIZE, DRY_RUN,
+    TAKE_PROFIT_MIN_GAIN_PCT
 )
 from core.analyzer import run_analysis, AnalysisResult, calc_momentum
 from core.sizing import calculate_bet_size, get_time_slot
@@ -67,6 +68,7 @@ class TradingEngine:
         self.current_position: Position | None = None
         self.current_market: dict | None = None
         self.running = False
+        self._traded_this_cycle: bool = False
 
     async def start(self):
         """Inicializa conexões e inicia o loop principal."""
@@ -137,12 +139,12 @@ class TradingEngine:
                     await self._phase_collect(market)
 
                 # ── Fase 2: Análise + Entrada (4:30 → 3:30) ──
-                elif time_remaining > ENTRY_CUTOFF and not self.current_position:
+                elif time_remaining > ENTRY_CUTOFF and not self.current_position and not self._traded_this_cycle:
                     await self._phase_analyze_and_enter(market, time_remaining)
 
-                # ── Fase 2b: Entry tardio (3:30 → 2:00) para mercado indeciso ──
-                elif time_remaining > 120 and not self.current_position:
-                    await self._phase_late_entry(market, time_remaining)
+                # ── Fase 2b: Entry tardio — DESATIVADO ──
+                # elif time_remaining > 120 and not self.current_position:
+                #     await self._phase_late_entry(market, time_remaining)
 
                 # ── Fase 3: Monitoramento + Hedge (até 0:00) ──
                 elif self.current_position and time_remaining > 0:
@@ -193,6 +195,7 @@ class TradingEngine:
 
         if best and best != self.current_market:
             self.current_market = best
+            self._traded_this_cycle = False
             self.share_buffer.clear()
             up_token = self._get_yes_token(best)
             down_token = self._get_no_token(best)
@@ -408,6 +411,7 @@ class TradingEngine:
                 entry_alignment=int(analysis.layer2_alignment)
             )
 
+            self._traded_this_cycle = True
             self.cycle_collector.record_trade(
                 direction=direction,
                 size=bet_size,
@@ -598,6 +602,25 @@ class TradingEngine:
                              entry=f"${pos.entry_price:.2f}",
                              gain=f"{exit_eval.gain_pct:.0%}")
 
+                    # ── Vender hedge se lucrativo quando posição principal sai ──
+                    if pos.has_hedge and not pos.hedge_exited and pos.hedge_token_id and yes_price > 0:
+                        hedge_now = (1 - yes_price) if pos.direction == "Up" else yes_price
+                        hedge_gain = (hedge_now - pos.hedge_price) / pos.hedge_price if pos.hedge_price > 0 else 0
+                        if hedge_gain > 0:
+                            hedge_shares = pos.hedge_potential_return
+                            for pct in [1.0, 0.95, 0.90]:
+                                sell_qty = round(hedge_shares * pct, 2)
+                                h_order = await execute_sell(
+                                    self.order_client, pos.hedge_token_id, sell_qty, hedge_now
+                                )
+                                if h_order:
+                                    pos.hedge_exited = True
+                                    log.info("hedge_sold_with_main",
+                                             gain=f"{hedge_gain:.0%}",
+                                             price=f"${hedge_now:.2f}",
+                                             qty=sell_qty)
+                                    break
+
                     try:
                         self.storage.conn.execute(
                             "UPDATE trades SET result = ?, pnl = ? "
@@ -611,6 +634,25 @@ class TradingEngine:
                     self.current_position = None
                     self.share_buffer.clear()
                     return
+
+        # ── 1b. HEDGE TAKE PROFIT — saída autônoma do hedge ──
+        if pos.has_hedge and not pos.hedge_exited and pos.hedge_token_id and yes_price > 0:
+            hedge_now = (1 - yes_price) if pos.direction == "Up" else yes_price
+            hedge_gain = (hedge_now - pos.hedge_price) / pos.hedge_price if pos.hedge_price > 0 else 0
+            if hedge_gain >= TAKE_PROFIT_MIN_GAIN_PCT:
+                hedge_shares = pos.hedge_potential_return
+                for pct in [1.0, 0.95, 0.90]:
+                    sell_qty = round(hedge_shares * pct, 2)
+                    h_order = await execute_sell(
+                        self.order_client, pos.hedge_token_id, sell_qty, hedge_now
+                    )
+                    if h_order:
+                        pos.hedge_exited = True
+                        log.info("hedge_take_profit",
+                                 gain=f"{hedge_gain:.0%}",
+                                 price=f"${hedge_now:.2f}",
+                                 qty=sell_qty)
+                        break
 
         # ── 2. LOCK PROFIT — desativado (estratégia EV Optimal não usa) ──
 
@@ -680,6 +722,7 @@ class TradingEngine:
                         pos.hedge_price = hedge_price
                         pos.hedge_direction = opposite_direction
                         pos.hedge_potential_return = hedge_return
+                        pos.hedge_token_id = hedge_token
 
                         self.hedge_tracker.record_hedge(hedge_cost, savings)
                         log.info("hedge_executed",

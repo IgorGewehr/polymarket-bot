@@ -97,9 +97,9 @@ def evaluate_early_exit(
     if bid_price < 0.20:
         return ExitEvaluation(True, "emergency", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
-    # ── 4. STOP LOSS — preço caiu demais (ativa SEMPRE, sem restrição de tempo) ──
+    # ── 4. STOP LOSS — preço caiu demais (só ativa até 3:30 restantes) ──
     price_drop = (entry_price - bid_price) / entry_price if entry_price > 0 else 0
-    if price_drop >= STOP_LOSS_THRESHOLD_PCT:
+    if price_drop >= STOP_LOSS_THRESHOLD_PCT and time_remaining <= 210:
         return ExitEvaluation(True, "stop_loss", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
     # ── 4. TAKE PROFIT — ganho bom (ativa SEMPRE, sem restrição de tempo) ──
