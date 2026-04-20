@@ -14,7 +14,7 @@ from config.settings import (
     BUFFER_SIZE, BTC_BUFFER_SIZE, DRY_RUN,
     TAKE_PROFIT_MIN_GAIN_PCT
 )
-from core.analyzer import run_analysis, AnalysisResult, calc_momentum
+from core.analyzer import run_analysis, AnalysisResult, calc_momentum, calc_slope
 from core.sizing import calculate_bet_size, get_time_slot
 from core.hedger import (
     Position, HedgeOpportunity, HedgeTracker,
@@ -27,7 +27,7 @@ from data.feeds import BinanceFeed, PolymarketFeed, PolymarketREST
 from data.storage import Storage
 from data.cycle_collector import CycleCollector
 from core.lock_profit import evaluate_lock
-from core.early_exit import evaluate_early_exit
+from core.early_exit import evaluate_early_exit, ExitEvaluation
 from execution.order_client import OrderClient, execute_trade, execute_hedge, execute_sell, execute_lock
 from monitoring.notifier import TelegramNotifier
 
@@ -291,76 +291,52 @@ class TradingEngine:
             btc_trend = "Neutral"
             trend_strength = 0
 
-        # ── 2. Ver o que o mercado acha ──
-        if yes_price > 0.50:
-            market_trend = "Up"
-            market_price = yes_price
-        else:
-            market_trend = "Down"
-            market_price = no_price
+        # ── 2. EV_OPTIMAL: seguir trend do BTC, range 0.52-0.58 ──────
+        # BTC neutro → pular ciclo (sem edge claro)
+        no_price_est = 1.0 - yes_price
 
-        # ── 3. Decisão de entrada ──
-
-        # Sem trend clara no BTC → esperar ou seguir mercado no deadline
         if btc_trend == "Neutral":
-            if time_remaining > ENTRY_CUTOFF + 10:
-                log.info("waiting_trend",
-                         slopes=f"1m={slopes['1m']:.4f} 2m={slopes['2m']:.4f} 3m={slopes['3m']:.4f}",
-                         msg="BTC sem trend clara, esperando")
-                return
-            else:
-                # Deadline: seguir o mercado
-                if 0.50 <= market_price <= 0.62:
-                    direction = market_trend
-                    entry_price = market_price
-                    log.info("entry_deadline_neutral",
-                             market=market_trend,
-                             price=f"${market_price:.2f}",
-                             msg="Sem trend BTC, seguindo mercado no deadline")
-                else:
-                    return
-
-        # BTC trend e mercado CONCORDAM + preço na faixa → ENTRAR
-        elif btc_trend == market_trend and 0.50 <= market_price <= 0.62:
-            direction = market_trend
-            entry_price = market_price
-            log.info("entry_aligned",
-                     btc_trend=btc_trend,
-                     strength=f"{trend_strength}/3",
-                     market=f"${market_price:.2f}",
-                     msg="Trend e mercado concordam")
-
-        # BTC e mercado DISCORDAM → esperar reversão
-        elif btc_trend != market_trend:
-            if time_remaining > ENTRY_CUTOFF + 10:
-                log.info("waiting_reversal",
-                         btc=btc_trend,
-                         strength=f"{trend_strength}/3",
-                         market=market_trend,
-                         price=f"${market_price:.2f}",
-                         remaining=f"{time_remaining:.0f}s")
-                return
-            else:
-                # Deadline: seguir mercado
-                if 0.50 <= market_price <= 0.62:
-                    direction = market_trend
-                    entry_price = market_price
-                    log.info("entry_deadline",
-                             btc=btc_trend,
-                             market=market_trend,
-                             price=f"${market_price:.2f}",
-                             msg="Deadline, seguindo mercado")
-                else:
-                    return
-
-        # Preço fora da faixa
-        elif not (0.50 <= market_price <= 0.62):
-            log.info("skip_price_range",
-                     price=f"${market_price:.2f}")
+            log.info("skip_btc_neutral",
+                     slopes=f"1m={slopes['1m']:.4f} 2m={slopes['2m']:.4f} 3m={slopes['3m']:.4f}",
+                     msg="BTC sem confirmação — pulando ciclo")
             return
+
+        if btc_trend == "Up":
+            if 0.55 <= yes_price <= 0.58:
+                direction = "Up"
+                entry_price = yes_price
+            else:
+                log.debug("skip_range", btc=btc_trend,
+                          yes=f"${yes_price:.2f}", msg="YES fora de 0.55-0.58")
+                return
         else:
-            direction = market_trend
-            entry_price = market_price
+            if 0.55 <= no_price_est <= 0.58:
+                direction = "Down"
+                entry_price = no_price_est
+            else:
+                log.debug("skip_range", btc=btc_trend,
+                          no=f"${no_price_est:.2f}", msg="NO fora de 0.55-0.58")
+                return
+
+        # ── Filtro de spike: não entrar se BTC acabou de disparar violentamente ──
+        # Se slope do último 1min é >3x o slope do 3min, BTC está em pico/vale agudo
+        # Nesses momentos o mercado frequentemente reverte antes do fim do ciclo
+        slope_1m = abs(slopes["1m"])
+        slope_3m = abs(slopes["3m"]) + 0.0001  # evitar divisão por zero
+        spike_ratio = slope_1m / slope_3m
+        if spike_ratio > 3.0:
+            log.info("skip_btc_spike",
+                     spike=f"{spike_ratio:.1f}x",
+                     slope_1m=f"{slopes['1m']:.4f}",
+                     slope_3m=f"{slopes['3m']:.4f}",
+                     msg="BTC em spike violento — aguardando estabilização")
+            return
+
+        log.info("entry_ev_optimal",
+                 dir=direction,
+                 entry=f"${entry_price:.2f}",
+                 btc=f"{btc_trend}({trend_strength}/3)",
+                 spike=f"{spike_ratio:.1f}x")
 
         expected_return = (1.0 - entry_price) / entry_price
 
@@ -383,6 +359,9 @@ class TradingEngine:
 
         shares = 5.0
         bet_size = shares * entry_price
+        # Polymarket cobra ~3% de fee no BUY, reduzindo tokens recebidos de 5.0 para ~4.84
+        # Usar 4.75 como floor seguro para evitar falha na primeira tentativa de venda
+        actual_shares = 4.75
 
         # ── EXECUTAR TRADE ──
         token_id = self._get_yes_token(market) if direction == "Up" \
@@ -402,8 +381,8 @@ class TradingEngine:
                 direction=direction,
                 bet_size=actual_cost,
                 entry_price=entry_price,
-                potential_return=shares,
-                shares=shares,
+                potential_return=actual_shares,
+                shares=actual_shares,
                 entry_time=time.time(),
                 market_id=market.get("conditionId", market.get("condition_id", "")),
                 token_id=token_id,
@@ -488,6 +467,7 @@ class TradingEngine:
 
         shares = 5.0
         bet_size = shares * entry_price
+        actual_shares = 4.75
 
         token_id = self._get_yes_token(market) if direction == "Up" \
             else self._get_no_token(market)
@@ -505,8 +485,8 @@ class TradingEngine:
                 direction=direction,
                 bet_size=actual_cost,
                 entry_price=entry_price,
-                potential_return=shares,
-                shares=shares,
+                potential_return=actual_shares,
+                shares=actual_shares,
                 entry_time=time.time(),
                 market_id=market.get("conditionId", market.get("condition_id", "")),
                 token_id=token_id,
@@ -571,6 +551,31 @@ class TradingEngine:
                          should=exit_eval.should_exit,
                          reason=exit_eval.reason or "none",
                          remaining=f"{time_remaining:.0f}s")
+
+            # ── Hold inteligente: BTC ainda acelerando → dar mais espaço ──
+            # Se o exit é ev_optimal (20-35% gain) mas BTC ainda acelera na nossa
+            # direção, segurar — pode haver mais upside antes da resolução.
+            if exit_eval.should_exit and exit_eval.reason in ("ev_optimal", "take_profit"):
+                if exit_eval.gain_pct < 0.40 and time_remaining > 90:
+                    btc_now = self.btc_buffer.get_prices()
+                    if len(btc_now) >= 60:
+                        slope_recent = calc_slope(btc_now[-30:])   # últimos 30s
+                        slope_prior  = calc_slope(btc_now[-60:-30]) # 30s anteriores
+                        still_accel = (
+                            (pos.direction == "Up"   and slope_recent > slope_prior > 0.002) or
+                            (pos.direction == "Down"  and slope_recent < slope_prior < -0.002)
+                        )
+                        if still_accel:
+                            log.info("hold_btc_accelerating",
+                                     gain=f"{exit_eval.gain_pct:.0%}",
+                                     slope_recent=f"{slope_recent:.4f}",
+                                     slope_prior=f"{slope_prior:.4f}",
+                                     msg="BTC acelerando — segurando para mais upside")
+                            exit_eval = ExitEvaluation(False, "", exit_eval.sell_price,
+                                                       exit_eval.sell_proceeds,
+                                                       exit_eval.sell_pnl,
+                                                       exit_eval.hold_ev,
+                                                       exit_eval.gain_pct)
 
             if exit_eval.should_exit:
                 # Vender todas as shares — retry com quantidade menor se falhar
@@ -669,7 +674,7 @@ class TradingEngine:
 
         # Check direto: nossa share caiu abaixo de $0.40?
         our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
-        price_dropped = our_price < 0.40
+        price_dropped = our_price < (pos.entry_price * 0.90)  # 10% abaixo do entry
 
         current_momentum = calc_momentum(share_prices)
         from core.analyzer import analyze_layer2_multiTF

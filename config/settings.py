@@ -91,11 +91,11 @@ LOSS_PENALTY_FLOOR = 0.20      # Mínimo 20% do sizing normal
 
 
 # ── Hedge ────────────────────────────────────────────────────────
-MAX_HEDGES_PER_DAY = 2
-MIN_LOSS_PROB_FOR_HEDGE = 0.55  # Só hedge se prob. de perder > 55%
-MIN_HEDGE_ROI = 0.15            # Odds do hedge > 15% retorno
-HEDGE_COOLDOWN_SECONDS = 900    # 15 min entre hedges
-HEDGE_COST_RATIO_LIMIT = 1.5   # Se custo > 1.5x savings, parar
+MAX_HEDGES_PER_DAY = 10         # Re-entry liberado por ciclo
+MIN_LOSS_PROB_FOR_HEDGE = 0.55  # Só re-entry se prob. de perder > 55%
+MIN_HEDGE_ROI = 0.15            # Odds do re-entry > 15% retorno
+HEDGE_COOLDOWN_SECONDS = 60     # 1 min entre re-entries (1 por ciclo)
+HEDGE_COST_RATIO_LIMIT = 2.0    # Tolerância maior para re-entries
 
 
 # ── Lock Profit (compra assimétrica YES+NO) ─────────────────────
@@ -109,18 +109,21 @@ LOCK_MIN_TIME_REMAINING = 30       # Não tentar lock com < 30s restantes
 # ── Early Exit (Take Profit / Stop Loss) ────────────────────────
 EARLY_EXIT_ENABLED = True
 TAKER_FEE_PCT = 0.0315             # Fee de taker para SELL orders
-TAKE_PROFIT_MIN_GAIN_PCT = 0.40    # Ganho mínimo de 40% para considerar TP (share $0.55 → $0.77)
-STOP_LOSS_THRESHOLD_PCT = 0.35     # Vender se preço caiu 35%+ do entry
+TAKE_PROFIT_MIN_GAIN_PCT = 0.20    # Ganho mínimo de 20% para TP (entry 0.45 → vende a 0.54)
+STOP_LOSS_THRESHOLD_PCT = 0.13     # Vender se preço caiu 13%+ do entry (entry 0.45 → stop 0.39)
+STOP_LOSS_TIME_CUTOFF = 270        # Stop ativo desde a entrada (4:30 restantes)
+TIME_STOP_REMAINING = 150          # Time stop: sair às 2:30 se ainda em perda
+TIME_STOP_MIN_DROP_PCT = 0.08      # Time stop ativa se caiu > 8% do entry
 EARLY_EXIT_MIN_TIME = 15           # Não vender nos últimos 15s
 EARLY_EXIT_MAX_TIME = 200          # Começar a avaliar exit mais cedo
 REVERSAL_RISK_DIVISOR = 1200.0     # Para desconto de reversão
 
 
 # ── Risk Management ─────────────────────────────────────────────
-MAX_DAILY_LOSS = 15.0           # Stop loss diário
+MAX_DAILY_LOSS = 5.0            # Stop loss diário (capital $10)
 MAX_TRADES_PER_DAY = 200
 MAX_TRADES_PER_HOUR = 12
-DRAWDOWN_REDUCE_THRESHOLD = 8.0  # Se cair $8 do pico, sizing = $1
+DRAWDOWN_REDUCE_THRESHOLD = 3.0  # Se cair $3 do pico, sizing = $1
 FORCED_SIZING_ON_DRAWDOWN = 1
 
 
