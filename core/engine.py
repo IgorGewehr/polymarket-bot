@@ -272,8 +272,10 @@ class TradingEngine:
             slopes[label] = calc_slope(btc_prices[-n:])
 
         # Votos: quantos timeframes dizem Up?
-        up_votes = sum(1 for s in slopes.values() if s > 0)
-        down_votes = 3 - up_votes
+        # Threshold mínimo para filtrar ruído em BTC lateral (~$1 por minuto normalizado)
+        SLOPE_NOISE_THRESHOLD = 0.005
+        up_votes = sum(1 for s in slopes.values() if s > SLOPE_NOISE_THRESHOLD)
+        down_votes = sum(1 for s in slopes.values() if s < -SLOPE_NOISE_THRESHOLD)
 
         # Trend só é confirmada se 2/3 ou 3/3 concordam
         if up_votes >= 2:
@@ -376,17 +378,8 @@ class TradingEngine:
         )
         confidence = analysis.confidence if analysis else 0.0
 
-        bet_size = calculate_bet_size(
-            confidence=confidence,
-            expected_return=expected_return,
-            time_remaining=time_remaining,
-            direction=direction,
-            consecutive_losses=self.risk_manager.state.consecutive_losses,
-            is_drawdown=self.risk_manager.is_drawdown,
-            is_squeeze_breakout=analysis.is_squeeze_breakout if analysis else False,
-            entry_price=entry_price,
-            trend_strength=trend_strength,
-        )
+        shares = 5.0
+        bet_size = shares * entry_price
 
         # ── EXECUTAR TRADE ──
         token_id = self._get_yes_token(market) if direction == "Up" \
@@ -401,8 +394,7 @@ class TradingEngine:
         )
 
         if order:
-            shares = max(bet_size / entry_price, 5.0)  # Mínimo 5 (Polymarket enforces)
-            actual_cost = shares * entry_price
+            actual_cost = bet_size
             self.current_position = Position(
                 direction=direction,
                 bet_size=actual_cost,
@@ -490,17 +482,8 @@ class TradingEngine:
                  ret=f"{expected_return:.0%}",
                  remaining=f"{time_remaining:.0f}s")
 
-        # Sizing $3 para ter 5+ shares (habilita early exit)
-        bet_size = calculate_bet_size(
-            confidence=0.0,
-            expected_return=expected_return,
-            time_remaining=time_remaining,
-            direction=direction,
-            consecutive_losses=self.risk_manager.state.consecutive_losses,
-            is_drawdown=self.risk_manager.is_drawdown,
-            entry_price=entry_price,
-            trend_strength=2,
-        )
+        shares = 5.0
+        bet_size = shares * entry_price
 
         token_id = self._get_yes_token(market) if direction == "Up" \
             else self._get_no_token(market)
@@ -513,8 +496,7 @@ class TradingEngine:
         )
 
         if order:
-            shares = max(bet_size / entry_price, 5.0)
-            actual_cost = shares * entry_price
+            actual_cost = bet_size
             self.current_position = Position(
                 direction=direction,
                 bet_size=actual_cost,
@@ -630,53 +612,7 @@ class TradingEngine:
                     self.share_buffer.clear()
                     return
 
-        # ── 2. LOCK PROFIT — SÓ quando estamos PERDENDO ──
-        # Se share está acima do entry (ganhando) → não fazer lock, deixar take profit/safety sell agir
-        # Se share caiu abaixo do entry (perdendo) → lock para garantir que não perde tudo
-        our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
-        is_losing = our_price < pos.entry_price * 0.90  # Share caiu 10%+ do entry
-
-        if not pos.has_lock and not pos.has_hedge and time_remaining > 30 and is_losing:
-            opp_dir = "Down" if pos.direction == "Up" else "Up"
-            opp_token = self._get_no_token(market) if pos.direction == "Up" \
-                else self._get_yes_token(market)
-
-            if opp_token:
-                # Buscar preço real do lado oposto
-                price_b = await self.poly_rest.get_best_ask(opp_token)
-                if price_b is None:
-                    # Fallback: derivar do yes_price + buffer de spread
-                    derived = self.poly_feed.no_price if pos.direction == "Up" \
-                        else self.poly_feed.yes_price
-                    price_b = derived + 0.02  # Conservative spread
-
-                lock_opp = evaluate_lock(
-                    price_a=pos.entry_price,
-                    price_b=price_b,
-                    direction_b=opp_dir,
-                    token_id_b=opp_token,
-                    shares_a=pos.shares,
-                )
-
-                if lock_opp:
-                    order = await execute_lock(
-                        self.order_client, opp_token,
-                        lock_opp.price_b, lock_opp.shares,
-                    )
-                    if order:
-                        pos.has_lock = True
-                        pos.lock_price_b = lock_opp.price_b
-                        pos.lock_shares = lock_opp.shares
-                        pos.lock_guaranteed_profit = lock_opp.profit_total
-                        pos.lock_side_b_direction = opp_dir
-                        pos.lock_side_b_token_id = opp_token
-
-                        log.info("lock_profit_executed",
-                                 profit=f"${lock_opp.profit_total:.2f}",
-                                 a=f"${pos.entry_price:.2f}",
-                                 b=f"${lock_opp.price_b:.2f}",
-                                 sum=f"${pos.entry_price + lock_opp.price_b:.2f}")
-                        return  # Lock acquired, skip hedge
+        # ── 2. LOCK PROFIT — desativado (estratégia EV Optimal não usa) ──
 
         # Se lock ativo, não precisa de hedge
         if pos.has_lock:
