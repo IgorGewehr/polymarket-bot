@@ -247,6 +247,14 @@ class TradingEngine:
                 btc_price=self.btc_feed.last_price,
             )
 
+        # Hour whitelist check
+        from datetime import datetime, timezone
+        from config.settings import HOUR_WHITELIST_UTC
+        current_hour = datetime.now(timezone.utc).hour
+        if current_hour not in HOUR_WHITELIST_UTC:
+            log.debug("trade_blocked_hour", hour_utc=current_hour)
+            return
+
         # Risk check
         can_trade, reason = self.risk_manager.can_trade()
         if not can_trade:

@@ -38,6 +38,11 @@ MIN_TIME_REMAINING = 60         # Nunca apostar com < 1:00 restante
 HEDGE_MONITOR_INTERVAL = 2     # Monitorar posição a cada 2s
 
 
+# ── Horários permitidos (UTC) ────────────────────────────────────
+# 16-19 UTC = abertura US (12-3PM ET) — BTC trend forte, stop loss atrás de stop loss
+# Dados: 16h=-$1.25/trade, 17h=-$1.05, 18h=-$1.74, 19h=-$3.93 (399 trades EV Optimal)
+HOUR_WHITELIST_UTC = frozenset(range(24)) - frozenset({16, 17, 18, 19})
+
 # ── Filtros Absolutos ────────────────────────────────────────────
 MIN_DELTA = 4                   # Nunca apostar com delta < 4
 MIN_RETURN_PCT = 0.05           # Retorno mínimo de 5% (dados mostram que trades <10% ainda são lucrativos)
