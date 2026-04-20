@@ -139,7 +139,7 @@ class TradingEngine:
                     await self._phase_collect(market)
 
                 # ── Fase 2: Análise + Entrada (4:30 → 3:30) ──
-                elif time_remaining > ENTRY_CUTOFF and not self.current_position:
+                elif time_remaining > ENTRY_CUTOFF and not self.current_position and not self._traded_this_cycle:
                     await self._phase_analyze_and_enter(market, time_remaining)
 
                 # ── Fase 2b: Entry tardio — DESATIVADO ──
