@@ -11,9 +11,10 @@ from config.settings import (
     TICK_INTERVAL, ENTRY_WINDOW_START, ENTRY_WINDOW_SOFT,
     ENTRY_DEADLINE, ENTRY_CUTOFF, MIN_TIME_REMAINING,
     MIN_DELTA, MIN_RETURN_PCT, MIN_CONFIDENCE,
-    BUFFER_SIZE, BTC_BUFFER_SIZE, DRY_RUN
+    BUFFER_SIZE, BTC_BUFFER_SIZE, DRY_RUN,
+    TAKE_PROFIT_MIN_GAIN_PCT
 )
-from core.analyzer import run_analysis, AnalysisResult, calc_momentum
+from core.analyzer import run_analysis, AnalysisResult, calc_momentum, calc_slope
 from core.sizing import calculate_bet_size, get_time_slot
 from core.hedger import (
     Position, HedgeOpportunity, HedgeTracker,
@@ -67,7 +68,7 @@ class TradingEngine:
         self.current_position: Position | None = None
         self.current_market: dict | None = None
         self.running = False
-        self._cycle_exited: str = ""  # Market ID do ciclo onde já saímos — bloqueia re-entry
+        self._traded_this_cycle: bool = False
 
     async def start(self):
         """Inicializa conexões e inicia o loop principal."""
@@ -138,12 +139,12 @@ class TradingEngine:
                     await self._phase_collect(market)
 
                 # ── Fase 2: Análise + Entrada (4:30 → 3:30) ──
-                elif time_remaining > ENTRY_CUTOFF and not self.current_position:
+                elif time_remaining > ENTRY_CUTOFF and not self.current_position and not self._traded_this_cycle:
                     await self._phase_analyze_and_enter(market, time_remaining)
 
-                # ── Fase 2b: Entry tardio (3:30 → 2:00) para mercado indeciso ──
-                elif time_remaining > 120 and not self.current_position:
-                    await self._phase_late_entry(market, time_remaining)
+                # ── Fase 2b: Entry tardio — DESATIVADO ──
+                # elif time_remaining > 120 and not self.current_position:
+                #     await self._phase_late_entry(market, time_remaining)
 
                 # ── Fase 3: Monitoramento + Hedge (até 0:00) ──
                 elif self.current_position and time_remaining > 0:
@@ -194,7 +195,7 @@ class TradingEngine:
 
         if best and best != self.current_market:
             self.current_market = best
-            self._cycle_exited = ""  # Novo ciclo → reset re-entry block
+            self._traded_this_cycle = False
             self.share_buffer.clear()
             up_token = self._get_yes_token(best)
             down_token = self._get_no_token(best)
@@ -279,8 +280,10 @@ class TradingEngine:
             slopes[label] = calc_slope(btc_prices[-n:])
 
         # Votos: quantos timeframes dizem Up?
-        up_votes = sum(1 for s in slopes.values() if s > 0)
-        down_votes = 3 - up_votes
+        # Threshold mínimo para filtrar ruído em BTC lateral (~$1 por minuto normalizado)
+        SLOPE_NOISE_THRESHOLD = 0.005
+        up_votes = sum(1 for s in slopes.values() if s > SLOPE_NOISE_THRESHOLD)
+        down_votes = sum(1 for s in slopes.values() if s < -SLOPE_NOISE_THRESHOLD)
 
         # Trend só é confirmada se 2/3 ou 3/3 concordam
         if up_votes >= 2:
@@ -293,95 +296,52 @@ class TradingEngine:
             btc_trend = "Neutral"
             trend_strength = 0
 
-        # ── 2. Ver o que o mercado acha ──
-        if yes_price > 0.50:
-            market_trend = "Up"
-            market_price = yes_price
-        else:
-            market_trend = "Down"
-            market_price = no_price
+        # ── 2. EV_OPTIMAL: seguir trend do BTC, range 0.52-0.58 ──────
+        # BTC neutro → pular ciclo (sem edge claro)
+        no_price_est = 1.0 - yes_price
 
-        # ── 2b. Delta acceleration check ──
-        # Delta alto E caindo = momentum enfraquecendo → possível reversão
-        # Não bloqueia (bons trades acontecem em delta <10), mas reduz sizing
-        share_prices = self.share_buffer.get_prices()
-        delta_falling = False
-        current_delta = 0.0
-        if len(share_prices) >= 6:
-            current_delta = abs(share_prices[-1] - share_prices[0]) * 10000
-            # Calcular delta de 3 ticks atrás
-            mid = len(share_prices) // 2
-            past_delta = abs(share_prices[mid] - share_prices[0]) * 10000
-            # Delta estava alto (>40) e agora caiu → momentum revertendo
-            if past_delta > 40 and current_delta < past_delta * 0.7:
-                delta_falling = True
-                log.info("delta_falling",
-                         current=f"{current_delta:.0f}",
-                         past=f"{past_delta:.0f}",
-                         msg="Momentum enfraquecendo, sizing reduzido")
-
-        # ── 3. Decisão de entrada ──
-
-        # Sem trend clara no BTC → esperar ou seguir mercado no deadline
         if btc_trend == "Neutral":
-            if time_remaining > ENTRY_CUTOFF + 10:
-                log.info("waiting_trend",
-                         slopes=f"1m={slopes['1m']:.4f} 2m={slopes['2m']:.4f} 3m={slopes['3m']:.4f}",
-                         msg="BTC sem trend clara, esperando")
-                return
-            else:
-                # Deadline: seguir o mercado
-                if 0.48 <= market_price <= 0.56:
-                    direction = market_trend
-                    entry_price = market_price
-                    log.info("entry_deadline_neutral",
-                             market=market_trend,
-                             price=f"${market_price:.2f}",
-                             msg="Sem trend BTC, seguindo mercado no deadline")
-                else:
-                    return
-
-        # BTC trend e mercado CONCORDAM + preço na faixa → ENTRAR
-        elif btc_trend == market_trend and 0.48 <= market_price <= 0.56:
-            direction = market_trend
-            entry_price = market_price
-            log.info("entry_aligned",
-                     btc_trend=btc_trend,
-                     strength=f"{trend_strength}/3",
-                     market=f"${market_price:.2f}",
-                     msg="Trend e mercado concordam")
-
-        # BTC e mercado DISCORDAM → esperar reversão
-        elif btc_trend != market_trend:
-            if time_remaining > ENTRY_CUTOFF + 10:
-                log.info("waiting_reversal",
-                         btc=btc_trend,
-                         strength=f"{trend_strength}/3",
-                         market=market_trend,
-                         price=f"${market_price:.2f}",
-                         remaining=f"{time_remaining:.0f}s")
-                return
-            else:
-                # Deadline: seguir mercado
-                if 0.48 <= market_price <= 0.56:
-                    direction = market_trend
-                    entry_price = market_price
-                    log.info("entry_deadline",
-                             btc=btc_trend,
-                             market=market_trend,
-                             price=f"${market_price:.2f}",
-                             msg="Deadline, seguindo mercado")
-                else:
-                    return
-
-        # Preço fora da faixa
-        elif not (0.48 <= market_price <= 0.56):
-            log.info("skip_price_range",
-                     price=f"${market_price:.2f}")
+            log.info("skip_btc_neutral",
+                     slopes=f"1m={slopes['1m']:.4f} 2m={slopes['2m']:.4f} 3m={slopes['3m']:.4f}",
+                     msg="BTC sem confirmação — pulando ciclo")
             return
+
+        if btc_trend == "Up":
+            if 0.55 <= yes_price <= 0.58:
+                direction = "Up"
+                entry_price = yes_price
+            else:
+                log.debug("skip_range", btc=btc_trend,
+                          yes=f"${yes_price:.2f}", msg="YES fora de 0.55-0.58")
+                return
         else:
-            direction = market_trend
-            entry_price = market_price
+            if 0.55 <= no_price_est <= 0.58:
+                direction = "Down"
+                entry_price = no_price_est
+            else:
+                log.debug("skip_range", btc=btc_trend,
+                          no=f"${no_price_est:.2f}", msg="NO fora de 0.55-0.58")
+                return
+
+        # ── Filtro de spike: não entrar se BTC acabou de disparar violentamente ──
+        # Se slope do último 1min é >3x o slope do 3min, BTC está em pico/vale agudo
+        # Nesses momentos o mercado frequentemente reverte antes do fim do ciclo
+        slope_1m = abs(slopes["1m"])
+        slope_3m = abs(slopes["3m"]) + 0.0001  # evitar divisão por zero
+        spike_ratio = slope_1m / slope_3m
+        if spike_ratio > 3.0:
+            log.info("skip_btc_spike",
+                     spike=f"{spike_ratio:.1f}x",
+                     slope_1m=f"{slopes['1m']:.4f}",
+                     slope_3m=f"{slopes['3m']:.4f}",
+                     msg="BTC em spike violento — aguardando estabilização")
+            return
+
+        log.info("entry_ev_optimal",
+                 dir=direction,
+                 entry=f"${entry_price:.2f}",
+                 btc=f"{btc_trend}({trend_strength}/3)",
+                 spike=f"{spike_ratio:.1f}x")
 
         expected_return = (1.0 - entry_price) / entry_price
 
@@ -402,18 +362,11 @@ class TradingEngine:
         )
         confidence = analysis.confidence if analysis else 0.0
 
-        bet_size = calculate_bet_size(
-            confidence=confidence,
-            expected_return=expected_return,
-            time_remaining=time_remaining,
-            direction=direction,
-            consecutive_losses=self.risk_manager.state.consecutive_losses,
-            consecutive_wins=self.risk_manager.state.consecutive_wins,
-            is_drawdown=self.risk_manager.is_drawdown,
-            is_squeeze_breakout=analysis.is_squeeze_breakout if analysis else False,
-            entry_price=entry_price,
-            trend_strength=trend_strength,
-        )
+        shares = 5.0
+        bet_size = shares * entry_price
+        # Polymarket cobra ~3% de fee no BUY, reduzindo tokens recebidos de 5.0 para ~4.84
+        # Usar 4.75 como floor seguro para evitar falha na primeira tentativa de venda
+        actual_shares = 4.75
 
         # (sizing fixo via kelly-lite — sem delta_falling)
 
@@ -430,14 +383,13 @@ class TradingEngine:
         )
 
         if order:
-            shares = max(bet_size / entry_price, 5.0)  # Mínimo 5 (Polymarket enforces)
-            actual_cost = shares * entry_price
+            actual_cost = bet_size
             self.current_position = Position(
                 direction=direction,
                 bet_size=actual_cost,
                 entry_price=entry_price,
-                potential_return=shares,
-                shares=shares,
+                potential_return=actual_shares,
+                shares=actual_shares,
                 entry_time=time.time(),
                 market_id=market.get("conditionId", market.get("condition_id", "")),
                 token_id=token_id,
@@ -448,6 +400,7 @@ class TradingEngine:
             self.current_position.entry_volume_imbalance = \
                 getattr(analysis, 'volume_imbalance', 0.0) if analysis else 0.0
 
+            self._traded_this_cycle = True
             self.cycle_collector.record_trade(
                 direction=direction,
                 size=bet_size,
@@ -527,17 +480,9 @@ class TradingEngine:
                  ret=f"{expected_return:.0%}",
                  remaining=f"{time_remaining:.0f}s")
 
-        bet_size = calculate_bet_size(
-            confidence=0.0,
-            expected_return=expected_return,
-            time_remaining=time_remaining,
-            direction=direction,
-            consecutive_losses=self.risk_manager.state.consecutive_losses,
-            consecutive_wins=self.risk_manager.state.consecutive_wins,
-            is_drawdown=self.risk_manager.is_drawdown,
-            entry_price=entry_price,
-            trend_strength=2,
-        )
+        shares = 5.0
+        bet_size = shares * entry_price
+        actual_shares = 4.75
 
         token_id = self._get_yes_token(market) if direction == "Up" \
             else self._get_no_token(market)
@@ -550,14 +495,13 @@ class TradingEngine:
         )
 
         if order:
-            shares = max(bet_size / entry_price, 5.0)
-            actual_cost = shares * entry_price
+            actual_cost = bet_size
             self.current_position = Position(
                 direction=direction,
                 bet_size=actual_cost,
                 entry_price=entry_price,
-                potential_return=shares,
-                shares=shares,
+                potential_return=actual_shares,
+                shares=actual_shares,
                 entry_time=time.time(),
                 market_id=market.get("conditionId", market.get("condition_id", "")),
                 token_id=token_id,
@@ -656,6 +600,31 @@ class TradingEngine:
                          reason=exit_eval.reason or "none",
                          remaining=f"{time_remaining:.0f}s")
 
+            # ── Hold inteligente: BTC ainda acelerando → dar mais espaço ──
+            # Se o exit é ev_optimal (20-35% gain) mas BTC ainda acelera na nossa
+            # direção, segurar — pode haver mais upside antes da resolução.
+            if exit_eval.should_exit and exit_eval.reason in ("ev_optimal", "take_profit"):
+                if exit_eval.gain_pct < 0.40 and time_remaining > 90:
+                    btc_now = self.btc_buffer.get_prices()
+                    if len(btc_now) >= 60:
+                        slope_recent = calc_slope(btc_now[-30:])   # últimos 30s
+                        slope_prior  = calc_slope(btc_now[-60:-30]) # 30s anteriores
+                        still_accel = (
+                            (pos.direction == "Up"   and slope_recent > slope_prior > 0.002) or
+                            (pos.direction == "Down"  and slope_recent < slope_prior < -0.002)
+                        )
+                        if still_accel:
+                            log.info("hold_btc_accelerating",
+                                     gain=f"{exit_eval.gain_pct:.0%}",
+                                     slope_recent=f"{slope_recent:.4f}",
+                                     slope_prior=f"{slope_prior:.4f}",
+                                     msg="BTC acelerando — segurando para mais upside")
+                            exit_eval = ExitEvaluation(False, "", exit_eval.sell_price,
+                                                       exit_eval.sell_proceeds,
+                                                       exit_eval.sell_pnl,
+                                                       exit_eval.hold_ev,
+                                                       exit_eval.gain_pct)
+
             if exit_eval.should_exit:
                 # Cancelar AMBOS limit sells antes de vender no market
                 if getattr(pos, '_limit_sell_active', False) and getattr(pos, '_limit_sell_id', None):
@@ -704,6 +673,25 @@ class TradingEngine:
                              hedge_cost=f"${pos.hedge_cost:.2f}" if pos.has_hedge else "none",
                              gain=f"{exit_eval.gain_pct:.0%}")
 
+                    # ── Vender hedge se lucrativo quando posição principal sai ──
+                    if pos.has_hedge and not pos.hedge_exited and pos.hedge_token_id and yes_price > 0:
+                        hedge_now = (1 - yes_price) if pos.direction == "Up" else yes_price
+                        hedge_gain = (hedge_now - pos.hedge_price) / pos.hedge_price if pos.hedge_price > 0 else 0
+                        if hedge_gain > 0:
+                            hedge_shares = pos.hedge_potential_return
+                            for pct in [1.0, 0.95, 0.90]:
+                                sell_qty = round(hedge_shares * pct, 2)
+                                h_order = await execute_sell(
+                                    self.order_client, pos.hedge_token_id, sell_qty, hedge_now
+                                )
+                                if h_order:
+                                    pos.hedge_exited = True
+                                    log.info("hedge_sold_with_main",
+                                             gain=f"{hedge_gain:.0%}",
+                                             price=f"${hedge_now:.2f}",
+                                             qty=sell_qty)
+                                    break
+
                     try:
                         self.storage.conn.execute(
                             "UPDATE trades SET result = ?, pnl = ? "
@@ -719,59 +707,26 @@ class TradingEngine:
                     self.share_buffer.clear()
                     return
 
-        # ── HOLD TO RESOLUTION — sem lock, sem hedge ──
-        # Dados: hedges custaram -$15 num dia, locks destruíram winners
-        # 67% accuracy × resolução binária = melhor que qualquer exit de loss
-        return
-
-        # ── CÓDIGO ABAIXO DESATIVADO (mantido pra referência) ──
-        # ── 2. LOCK PROFIT — SÓ quando estamos PERDENDO ──
-        # Se share está acima do entry (ganhando) → não fazer lock, deixar take profit/safety sell agir
-        # Se share caiu abaixo do entry (perdendo) → lock para garantir que não perde tudo
-        our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
-        is_losing = our_price < pos.entry_price * 0.90  # Share caiu 10%+ do entry
-
-        if not pos.has_lock and not pos.has_hedge and time_remaining > 30 and is_losing:
-            opp_dir = "Down" if pos.direction == "Up" else "Up"
-            opp_token = self._get_no_token(market) if pos.direction == "Up" \
-                else self._get_yes_token(market)
-
-            if opp_token:
-                # Buscar preço real do lado oposto
-                price_b = await self.poly_rest.get_best_ask(opp_token)
-                if price_b is None:
-                    # Fallback: derivar do yes_price + buffer de spread
-                    derived = self.poly_feed.no_price if pos.direction == "Up" \
-                        else self.poly_feed.yes_price
-                    price_b = derived + 0.02  # Conservative spread
-
-                lock_opp = evaluate_lock(
-                    price_a=pos.entry_price,
-                    price_b=price_b,
-                    direction_b=opp_dir,
-                    token_id_b=opp_token,
-                    shares_a=pos.shares,
-                )
-
-                if lock_opp:
-                    order = await execute_lock(
-                        self.order_client, opp_token,
-                        lock_opp.price_b, lock_opp.shares,
+        # ── 1b. HEDGE TAKE PROFIT — saída autônoma do hedge ──
+        if pos.has_hedge and not pos.hedge_exited and pos.hedge_token_id and yes_price > 0:
+            hedge_now = (1 - yes_price) if pos.direction == "Up" else yes_price
+            hedge_gain = (hedge_now - pos.hedge_price) / pos.hedge_price if pos.hedge_price > 0 else 0
+            if hedge_gain >= TAKE_PROFIT_MIN_GAIN_PCT:
+                hedge_shares = pos.hedge_potential_return
+                for pct in [1.0, 0.95, 0.90]:
+                    sell_qty = round(hedge_shares * pct, 2)
+                    h_order = await execute_sell(
+                        self.order_client, pos.hedge_token_id, sell_qty, hedge_now
                     )
-                    if order:
-                        pos.has_lock = True
-                        pos.lock_price_b = lock_opp.price_b
-                        pos.lock_shares = lock_opp.shares
-                        pos.lock_guaranteed_profit = lock_opp.profit_total
-                        pos.lock_side_b_direction = opp_dir
-                        pos.lock_side_b_token_id = opp_token
+                    if h_order:
+                        pos.hedge_exited = True
+                        log.info("hedge_take_profit",
+                                 gain=f"{hedge_gain:.0%}",
+                                 price=f"${hedge_now:.2f}",
+                                 qty=sell_qty)
+                        break
 
-                        log.info("lock_profit_executed",
-                                 profit=f"${lock_opp.profit_total:.2f}",
-                                 a=f"${pos.entry_price:.2f}",
-                                 b=f"${lock_opp.price_b:.2f}",
-                                 sum=f"${pos.entry_price + lock_opp.price_b:.2f}")
-                        return  # Lock acquired, skip hedge
+        # ── 2. LOCK PROFIT — desativado (estratégia EV Optimal não usa) ──
 
         # Se lock ativo, não precisa de hedge
         if pos.has_lock:
@@ -786,7 +741,7 @@ class TradingEngine:
 
         # Check direto: nossa share caiu abaixo de $0.40?
         our_price = yes_price if pos.direction == "Up" else (1 - yes_price)
-        price_dropped = our_price < 0.40
+        price_dropped = our_price < (pos.entry_price * 0.90)  # 10% abaixo do entry
 
         current_momentum = calc_momentum(share_prices)
         from core.analyzer import analyze_layer2_multiTF
@@ -839,6 +794,7 @@ class TradingEngine:
                         pos.hedge_price = hedge_price
                         pos.hedge_direction = opposite_direction
                         pos.hedge_potential_return = hedge_return
+                        pos.hedge_token_id = hedge_token
 
                         self.hedge_tracker.record_hedge(hedge_cost, savings)
                         log.info("hedge_executed",

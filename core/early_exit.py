@@ -17,7 +17,11 @@ Exits em ordem de prioridade:
 """
 import structlog
 from dataclasses import dataclass
-from config.settings import TAKER_FEE_PCT, REVERSAL_RISK_DIVISOR
+from config.settings import (
+    TAKER_FEE_PCT, TAKE_PROFIT_MIN_GAIN_PCT,
+    STOP_LOSS_THRESHOLD_PCT, REVERSAL_RISK_DIVISOR,
+    STOP_LOSS_TIME_CUTOFF, TIME_STOP_REMAINING, TIME_STOP_MIN_DROP_PCT,
+)
 
 log = structlog.get_logger()
 
@@ -129,12 +133,27 @@ def evaluate_early_exit(
         return ExitEvaluation(True, "delta_guard", bid_price, sell_proceeds,
                               sell_pnl, hold_ev, gain_pct)
 
-    # ═══════════════════════════════════════════════════════
-    # 5. STOP LOSS — perda atingiu -30% do valor de entrada
-    # ═══════════════════════════════════════════════════════
-    if gain_pct <= -0.30:
-        return ExitEvaluation(True, "stop_loss", bid_price, sell_proceeds,
-                              sell_pnl, hold_ev, gain_pct)
+    # ── 3. EMERGENCY SELL — share abaixo de $0.20 → vender IMEDIATAMENTE ──
+    if bid_price < 0.20:
+        return ExitEvaluation(True, "emergency", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
+    # ── 4. STOP LOSS — preço caiu 13%+ do entry (ativo desde a entrada) ──
+    price_drop = (entry_price - bid_price) / entry_price if entry_price > 0 else 0
+    if price_drop >= STOP_LOSS_THRESHOLD_PCT and time_remaining <= STOP_LOSS_TIME_CUTOFF:
+        return ExitEvaluation(True, "stop_loss", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
+    # ── 5. TIME STOP — aos 2:30 restantes, sair se ainda caindo > 8% ──
+    # Evita segurar um trade perdedor até o fim sem reversão visível
+    if time_remaining <= TIME_STOP_REMAINING and gain_pct < -TIME_STOP_MIN_DROP_PCT:
+        return ExitEvaluation(True, "time_stop", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
+    # ── 6. TAKE PROFIT — ganho >= 20% (ativa SEMPRE, sem restrição de tempo) ──
+    if gain_pct >= TAKE_PROFIT_MIN_GAIN_PCT and sell_pnl > hold_ev:
+        return ExitEvaluation(True, "take_profit", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
+
+    # ── 7. EV PURO — vender é significativamente melhor (gain >= 20%) ──
+    if gain_pct >= 0.20 and sell_pnl > 0 and sell_pnl > hold_ev * 1.30:
+        return ExitEvaluation(True, "ev_optimal", bid_price, sell_proceeds, sell_pnl, hold_ev, gain_pct)
 
     # ═══════════════════════════════════════════════════════
     # 6. HOLD — aguardar recuperação ou resolução

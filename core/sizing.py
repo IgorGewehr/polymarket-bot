@@ -43,14 +43,24 @@ def calculate_bet_size(
     if is_drawdown:
         return FORCED_SIZING_ON_DRAWDOWN
 
-    if consecutive_losses >= 3:
-        return 2   # 3+ losses: mínimo
-    elif consecutive_losses >= 2:
-        return 4   # 2 losses: cautela
-    elif consecutive_wins >= 3:
-        return 8   # 3+ wins seguidas: escalar (cap)
-    else:
-        return 6   # Base
+    # Penalty por losses consecutivos
+    loss_penalty = max(
+        LOSS_PENALTY_FLOOR,
+        1.0 - (consecutive_losses * LOSS_PENALTY_RATE)
+    )
+
+    # Sizing baseado na força da trend + preço da share
+    # $3 = trend forte + preço bom (habilita lock e early exit com 5+ shares)
+    # $2 = trend moderada ou preço alto
+    # $1 = após 2+ losses seguidos
+
+    if loss_penalty < 0.6:
+        return 3  # Após 2+ losses, sizing reduzido
+
+    if trend_strength >= 2:
+        return 5  # Trend 2/3+ = $5
+
+    return 3  # Trend fraca = $3
 
 
 def sizing_breakdown(
